@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.shellz.keepassist"
+    android:versionCode="13"
+    android:versionName="2.2">
+
+    <uses-sdk android:minSdkVersion="27" android:targetSdkVersion="33" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher_ka"
+        android:roundIcon="@mipmap/ic_launcher_ka"
+        android:label="@string/app_name"
+        android:hasCode="true">
+
+        <!-- 故意不声明 MAIN/LAUNCHER：桌面不出现图标（隐藏入口为「我的课程」标题长按）。
+             SettingsActivity 仍可被 root 的显式 am start 拉起，模块图标供 Vector/LSPosed 读取。 -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar" />
+
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Keep 助手：开屏广告秒跳过、启动直达我的课程-练过、详情页自动开练、离线可练、练过的课自动下载" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposedscope" />
+    </application>
+</manifest>

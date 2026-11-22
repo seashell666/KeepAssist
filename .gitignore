@@ -1,0 +1,19 @@
+# 构建产物
+out/
+ka.jks
+*.class
+
+# 由 *.b64 还原出来的二进制不入库
+res/mipmap-*/ic_launcher_ka.png
+release-assets/*.apk
+release-assets/*.zip
+module/KeepAssist.apk
+
+# 本地工具链（自备，见 docs/BUILD.md）
+toolchain/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
