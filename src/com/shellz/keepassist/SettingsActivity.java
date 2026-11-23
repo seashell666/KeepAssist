@@ -388,10 +388,10 @@ public class SettingsActivity extends Activity {
                 "把顶部「N 节课程」改成实际的剩余数量", swCount));
         root.addView(c8);
 
-        swWant = toggle(false);
+        swWant = toggle(true);
         LinearLayout c9 = card();
         c9.addView(head("WT", "打开课程时自动加入「想练」",
-                "进入课程详情后自动点一次「想练」（已加入则不动）", swWant));
+                "进课程自动点一次「想练」；已想练（绿色）不会重复点", swWant));
         root.addView(c9);
 
         // ---------------- 按钮
@@ -469,7 +469,7 @@ public class SettingsActivity extends Activity {
             swWifi.setChecked(true);
             swHide.setChecked(true);
             swCount.setChecked(true);
-            swWant.setChecked(false);
+            swWant.setChecked(true);
             sbDelay.setProgress(delay - 1);
             sbSleep.setProgress(sleep);
             etDays.setText(String.valueOf(days));

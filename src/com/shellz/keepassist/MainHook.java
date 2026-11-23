@@ -238,8 +238,12 @@ public class MainHook implements IXposedHookLoadPackage {
         static volatile boolean hideCourse = true;
         /** 移除后同步顶部的「N 节课程」数量 */
         static volatile boolean syncCount  = true;
-        /** 打开课程详情时自动点「想练」（页面没有这个按钮就不动） */
-        static volatile boolean autoWant   = false;
+        /**
+         * 打开课程详情时自动点「想练」。
+         * 实测：点完按钮文案会从「想练」变成绿色的「已想练」，所以只认准「想练」再点，
+         * 就不会把用户已经加过的取消掉 —— 可以安全地默认开启。
+         */
+        static volatile boolean autoWant   = true;
         static volatile long    lastLoad   = 0;
         static volatile boolean loading    = false;
 

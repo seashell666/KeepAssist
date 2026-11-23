@@ -36,8 +36,8 @@ jobs:
       - name: Verify checksums
         run: |
           set -euo pipefail
-          echo "9e23159a1b19ded1bc213950bf3c7acb24b688ab9c81553bbc425d0d02eda06e  dist/KeepAssist-v2.3.apk" | sha256sum -c -
-          echo "2dc59dc58e8bd2f6910e1443dca74df85f0d836102f676fb1696dcb5f33ccd5a  dist/KeepAssist-Magisk-v2.3.zip" | sha256sum -c -
+          echo "3da4d472b247c88509b96f1c022231b8b66d20861c86398eb57a863fd2c074d0  dist/KeepAssist-v2.3.apk" | sha256sum -c -
+          echo "f8e5a8aa938deef3635437a63864716dad457340a6f0eb2739c0b601cff2121c  dist/KeepAssist-Magisk-v2.3.zip" | sha256sum -c -
 
       - name: Create or update release
         env:
