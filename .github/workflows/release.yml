@@ -1,8 +1,8 @@
-name: Publish v2.2 release
+name: Publish v2.3 release
 
 # 仓库只通过 GitHub 内容接口提交（纯文本），无法直接上传二进制附件。
 # 由本工作流把 release-assets/*.b64 解码成 APK / Magisk zip，
-# 创建 v2.2 tag 与 release 并附上安装包。幂等：重复运行只更新已有 release。
+# 创建 v2.3 tag 与 release 并附上安装包。幂等：重复运行只更新已有 release。
 on:
   push:
     branches: [main]
@@ -36,25 +36,25 @@ jobs:
       - name: Verify checksums
         run: |
           set -euo pipefail
-          echo "abd2d8992372358864046f6f8f19c3bb168cf62c9790ee1158c6fbb304621835  dist/KeepAssist-v2.2.apk" | sha256sum -c -
-          echo "5e32142ab302e8c9e777592b45658267ba5edea2de044500fbabb129d5cabd18  dist/KeepAssist-Magisk-v2.2.zip" | sha256sum -c -
+          echo "9e23159a1b19ded1bc213950bf3c7acb24b688ab9c81553bbc425d0d02eda06e  dist/KeepAssist-v2.3.apk" | sha256sum -c -
+          echo "2dc59dc58e8bd2f6910e1443dca74df85f0d836102f676fb1696dcb5f33ccd5a  dist/KeepAssist-Magisk-v2.3.zip" | sha256sum -c -
 
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="v2.2"
-          APK="dist/KeepAssist-v2.2.apk"
-          ZIP="dist/KeepAssist-Magisk-v2.2.zip"
+          TAG="v2.3"
+          APK="dist/KeepAssist-v2.3.apk"
+          ZIP="dist/KeepAssist-Magisk-v2.3.zip"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists, refreshing notes and assets"
-            gh release edit "$TAG" --title "Keep 助手 v2.2" --notes-file RELEASE_NOTES.md
+            gh release edit "$TAG" --title "Keep 助手 v2.3" --notes-file RELEASE_NOTES.md
             gh release upload "$TAG" "$APK" "$ZIP" --clobber
           else
             echo "creating release $TAG"
             gh release create "$TAG" \
-              --title "Keep 助手 v2.2" \
+              --title "Keep 助手 v2.3" \
               --notes-file RELEASE_NOTES.md \
               --target "$GITHUB_SHA" \
               "$APK" "$ZIP"

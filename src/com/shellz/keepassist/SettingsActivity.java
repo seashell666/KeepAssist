@@ -46,6 +46,7 @@ public class SettingsActivity extends Activity {
     static final int C_TRACK      = 0xFFDCD2FF;
 
     Pill swAutoGo, swVol, swSleep, swAutoDl, swWifi, swVolFollow;
+    Pill swHide, swCount, swWant;
     SeekBar sbDelay, sbSleep, sbVol;
     EditText etDays;
     TextView tvDelay, tvSleep, tvVol, tvStatus;
@@ -372,6 +373,27 @@ public class SettingsActivity extends Activity {
         c6.addView(dayRow);
         root.addView(c6);
 
+        // ---------------- 列表（放在最后，不占关键开关的位置）
+        root.addView(groupLabel("列表"));
+
+        swHide = toggle(true);
+        LinearLayout c7 = card();
+        c7.addView(head("RM", "长按课程移除",
+                "在「练过 / 想练」里按住课程 0.55 秒，确认后只在列表里隐藏", swHide));
+        root.addView(c7);
+
+        swCount = toggle(true);
+        LinearLayout c8 = card();
+        c8.addView(head("NO", "移除后同步课程数量",
+                "把顶部「N 节课程」改成实际的剩余数量", swCount));
+        root.addView(c8);
+
+        swWant = toggle(false);
+        LinearLayout c9 = card();
+        c9.addView(head("WT", "打开课程时自动加入「想练」",
+                "进入课程详情后自动点一次「想练」（已加入则不动）", swWant));
+        root.addView(c9);
+
         // ---------------- 按钮
         TextView save = text("保存", 16f, Color.WHITE, true);
         save.setGravity(Gravity.CENTER);
@@ -445,6 +467,9 @@ public class SettingsActivity extends Activity {
             swSleep.setChecked(true);
             swAutoDl.setChecked(true);
             swWifi.setChecked(true);
+            swHide.setChecked(true);
+            swCount.setChecked(true);
+            swWant.setChecked(false);
             sbDelay.setProgress(delay - 1);
             sbSleep.setProgress(sleep);
             etDays.setText(String.valueOf(days));
@@ -487,6 +512,9 @@ public class SettingsActivity extends Activity {
                 else if ("auto_download".equals(k)) swAutoDl.setChecked(!"0".equals(v));
                 else if ("wifi_only".equals(k)) swWifi.setChecked(!"0".equals(v));
                 else if ("checked_days".equals(k)) etDays.setText(String.valueOf(clamp(Integer.parseInt(v), 0, 365)));
+                else if ("hide_course".equals(k)) swHide.setChecked(!"0".equals(v));
+                else if ("sync_count".equals(k)) swCount.setChecked(!"0".equals(v));
+                else if ("auto_want".equals(k)) swWant.setChecked(!"0".equals(v));
             } catch (Throwable ignored) {}
         }
     }
@@ -508,7 +536,10 @@ public class SettingsActivity extends Activity {
                         : clamp(Math.round(sbVol.getProgress() * 1.5f), 0, 150)) + "\n"
                 + "auto_download=" + (swAutoDl.isChecked() ? 1 : 0) + "\n"
                 + "wifi_only=" + (swWifi.isChecked() ? 1 : 0) + "\n"
-                + "checked_days=" + days() + "\n";
+                + "checked_days=" + days() + "\n"
+                + "hide_course=" + (swHide.isChecked() ? 1 : 0) + "\n"
+                + "sync_count=" + (swCount.isChecked() ? 1 : 0) + "\n"
+                + "auto_want=" + (swWant.isChecked() ? 1 : 0) + "\n";
 
         tvStatus.setText("正在保存…");
         new Thread(new Runnable() {

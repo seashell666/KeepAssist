@@ -234,6 +234,12 @@ public class MainHook implements IXposedHookLoadPackage {
         static volatile boolean autoDl     = true;
         static volatile boolean wifiOnly   = true;
         static volatile int     checkDays  = 7;
+        /** 长按课程从列表移除（总开关） */
+        static volatile boolean hideCourse = true;
+        /** 移除后同步顶部的「N 节课程」数量 */
+        static volatile boolean syncCount  = true;
+        /** 打开课程详情时自动点「想练」（页面没有这个按钮就不动） */
+        static volatile boolean autoWant   = false;
         static volatile long    lastLoad   = 0;
         static volatile boolean loading    = false;
 
@@ -304,18 +310,23 @@ public class MainHook implements IXposedHookLoadPackage {
                     else if ("auto_download".equals(k)) autoDl    = !"0".equals(v);
                     else if ("wifi_only".equals(k))     wifiOnly  = !"0".equals(v);
                     else if ("checked_days".equals(k))  checkDays = clamp(Integer.parseInt(v), 0, 365);
+                    else if ("hide_course".equals(k))   hideCourse = !"0".equals(v);
+                    else if ("sync_count".equals(k))    syncCount  = !"0".equals(v);
+                    else if ("auto_want".equals(k))     autoWant   = !"0".equals(v);
                 } catch (Throwable ignored) {}
             }
             // 只在配置真的变了才写日志。这里 15 秒被调用一次，无条件 log 会让
             // 512KB 的日志被"cfg: ..."刷满，把真正的关键行挤掉。
             String fp = autoGo + "/" + goDelayMs + "/" + sleepSec + "/" + volLock
-                    + "/" + volTarget + "/" + autoDl + "/" + wifiOnly + "/" + checkDays;
+                    + "/" + volTarget + "/" + autoDl + "/" + wifiOnly + "/" + checkDays
+                    + "/" + hideCourse + "/" + syncCount + "/" + autoWant;
             if (fp.equals(sLastCfg)) return;
             sLastCfg = fp;
             log("cfg: autoGo=" + autoGo + " delay=" + goDelayMs + "ms sleep=" + sleepSec
                     + "s volLock=" + volLock + " volTarget=" + volTarget
                     + " autoDl=" + autoDl + " wifiOnly=" + wifiOnly
-                    + " checkedDays=" + checkDays);
+                    + " checkedDays=" + checkDays
+                    + " hide=" + hideCourse + " syncCount=" + syncCount + " autoWant=" + autoWant);
         }
 
         static String sLastCfg = "";
@@ -330,7 +341,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     + "\nvol_target=" + volTarget
                     + "\nauto_download=" + (autoDl ? 1 : 0)
                     + "\nwifi_only=" + (wifiOnly ? 1 : 0)
-                    + "\nchecked_days=" + checkDays;
+                    + "\nchecked_days=" + checkDays
+                    + "\nhide_course=" + (hideCourse ? 1 : 0)
+                    + "\nsync_count=" + (syncCount ? 1 : 0)
+                    + "\nauto_want=" + (autoWant ? 1 : 0);
         }
     }
 
@@ -637,20 +651,77 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("hookNewIntent " + t); }
     }
 
-    /** 课程页按返回时回到首页，避免直接退出 App */    void hookBack() {
+    /**
+     * 课程页按返回时回到 App 主页，避免直接退出 App。
+     *
+     * 为什么以前会退出：冷启动是用 FLAG_ACTIVITY_CLEAR_TASK 跳过来的，任务栈里
+     * 就只剩下 MyCourseActivity（MainActivity 已被清掉）。这时按返回 / 从左边缘右滑，
+     * Keep 自己把这个唯一页面 finish 掉 → 任务空了 → 系统直接退回桌面。
+     *
+     * 为什么以前"翻一下 tab 再返回"就正常：翻 tab 会在 Keep 内部压入返回栈，
+     * 第一次返回被它自己消费掉了，第二次才真正 finish —— 看起来就像"好了"。
+     *
+     * 所以两处都要拦：
+     *  1) Activity.finish()：不管返回键、手势还是 Keep 自己调的，只要是课程页且
+     *     已经是任务栈根（下面没有别的页面），先把 MainActivity 顶上去再放行；
+     *  2) onBackPressed：被子类重写且不调 super 时上面那条收不到，这里吃掉这次返回。
+     */
+    static volatile boolean sBackRedirect = false;
+
+    void hookBack() {
+        // (1) finish() 兜底：覆盖返回键、手势返回、Keep 自己 finish 的所有路径
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "finish", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    Activity a = (Activity) p.thisObject;
+                    if (a == null || !KEEP.equals(a.getPackageName())) return;
+                    if (!COURSE.equals(a.getClass().getName())) return;
+                    if (sBackRedirect) return;
+                    boolean root;
+                    try { root = a.isTaskRoot(); } catch (Throwable t) { root = false; }
+                    if (!root) return;   // 下面还有 Main，正常 finish 就行
+                    sBackRedirect = true;
+                    sColdNavTarget = MAIN;   // 别让 20 秒内的"重锚"把用户又拉回课程页
+                    log("back: course is task root -> start main");
+                    try {
+                        Intent i = new Intent();
+                        i.setClassName(KEEP, MAIN);
+                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        a.startActivity(i);
+                    } catch (Throwable t) { log("back start main fail " + t); }
+                    sMain.postDelayed(new Runnable() {
+                        public void run() { sBackRedirect = false; }
+                    }, 2000);
+                }
+            });
+        } catch (Throwable t) { log("hookFinish " + t); }
+
+        // (2) onBackPressed：被重写不调 super 的情况
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onBackPressed", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     Activity a = (Activity) p.thisObject;
                     if (!KEEP.equals(a.getPackageName())) return;
                     if (!COURSE.equals(a.getClass().getName())) return;
+                    boolean root;
+                    try { root = a.isTaskRoot(); } catch (Throwable t) { root = false; }
+                    if (!root) return;   // 正常返回上一层
+                    sBackRedirect = true;
+                    sColdNavTarget = MAIN;
                     try {
                         Intent i = new Intent();
                         i.setClassName(KEEP, MAIN);
                         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         a.startActivity(i);
-                        log("back: course -> main");
+                        p.setResult(null);   // 吃掉这次返回，由我们自己收尾
+                        // 主页已经在下面了，把课程页关掉，用户才真的"回到主页"。
+                        // finish 钩子看到 sBackRedirect 会跳过重复处理。
+                        a.finish();
+                        log("back: course -> main (consumed)");
                     } catch (Throwable t) { log("back fail " + t); }
+                    sMain.postDelayed(new Runnable() {
+                        public void run() { sBackRedirect = false; }
+                    }, 3000);
                 }
             });
         } catch (Throwable t) { log("hookBack " + t); }
@@ -713,7 +784,11 @@ public class MainHook implements IXposedHookLoadPackage {
             // Keep 的 Splash 在 finish 之后仍会把它自己的「进主页」流程跑完，
             // 几百毫秒后把 MainActivity 压在已下载课程页上面。此时直接 finish 掉主页，
             // 下层的已下载课程页就露出来了（比再跳一次更干净，没有闪屏）。
+            // 用户主动返回进主页时，这个 MainActivity 是我们自己拉起来的，
+            // 不能当成"Keep 又把主页顶上来"再 finish 掉（以前就是这里把返回吃掉，
+            // 表现成按返回没反应 / 直接退出 App）。
             if (sColdNavTarget != null && !MAIN.equals(sColdNavTarget) && !sMainBounced
+                    && !sBackRedirect
                     && SystemClock.uptimeMillis() - sColdNavT < 4000) {
                 sMainBounced = true;
                 log("main: rogue start over target -> finish main");
@@ -879,7 +954,7 @@ public class MainHook implements IXposedHookLoadPackage {
     // 用户要求：在「练过」列表长按某门课，弹窗确认后把它从列表里隐藏。
     // 列表是接口数据，模块不改服务器记录，只在本地把匹配的 item 设为 GONE。
 
-    /** 被用户移除的课程（存课程标题；列表 item 里拿不到 collectionId） */
+    /** 被用户移除的课程。key = "tab|课程标题"（练过/想练同名课互不影响） */
     static final java.util.LinkedHashSet<String> sHiddenCourses = new java.util.LinkedHashSet<String>();
     static boolean sHiddenLoaded = false;
     static float sDownX, sDownY;
@@ -888,6 +963,12 @@ public class MainHook implements IXposedHookLoadPackage {
     static int sHiddenScanStep = 0;
     static final long LONG_PRESS_MS = 550;
     static final float LONG_SLOP = 32f;
+
+    static String hiddenKey(String tab, String title) { return tab + "|" + title; }
+
+    boolean isHidden(String tab, String title) {
+        return sHiddenCourses.contains(hiddenKey(tab, title));
+    }
 
     void loadHidden() {
         if (sHiddenLoaded) return;
@@ -898,9 +979,12 @@ public class MainHook implements IXposedHookLoadPackage {
             String s = p.getString("hidden_courses", "");
             for (String x : s.split("\n")) {
                 x = x.trim();
-                if (x.length() > 0) sHiddenCourses.add(x);
+                if (x.length() == 0) continue;
+                // 兼容旧数据：没有 "tab|" 前缀的，当作「练过」里的
+                if (x.indexOf('|') < 0) x = hiddenKey(TAB_DONE, x);
+                sHiddenCourses.add(x);
             }
-            if (!sHiddenCourses.isEmpty()) log("hidden: " + sHiddenCourses.size() + " courses");
+            if (!sHiddenCourses.isEmpty()) log("hidden: " + sHiddenCourses.size() + " entries");
         } catch (Throwable t) { log("hidden load fail " + t); }
     }
 
@@ -959,6 +1043,18 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) {
             if (sLongTask != null) { sMain.removeCallbacks(sLongTask); sLongTask = null; }
+            // 抬手后可能是切了 tab（练过 / 想练）。等列表刷出来再按当前 tab 重新应用一次，
+            // 否则"在练过删的课"会在切到想练后仍被隐藏（旧实现是全局按标题隐藏）。
+            final Activity ca = sCur;
+            if (ca != null && COURSE.equals(ca.getClass().getName())) {
+                sMain.postDelayed(new Runnable() {
+                    public void run() {
+                        if (sCur != ca) return;
+                        applyHidden(ca);
+                        if (Cfg.syncCount) syncCountLabel(ca);
+                    }
+                }, 420);
+            }
         }
     }
 
@@ -1111,16 +1207,59 @@ public class MainHook implements IXposedHookLoadPackage {
     void onCourseLongPress(final float x, final float y) {
         Activity a = sCur;
         if (a == null || !COURSE.equals(a.getClass().getName())) return;
+        if (!Cfg.hideCourse) { log("long press ignored (hide_course=0)"); return; }
         View root = decor(a);
         if (root == null) return;
         View item = findListItem(root, x, y);
         if (item == null) { log("long press: no item at " + (int) x + "," + (int) y); return; }
         final String title = itemTitle(item);
         if (title == null || title.length() < 2) { log("long press: no title"); return; }
-        log("long press -> " + title);
+        // 「练过」和「想练」里可能有同名课程，移除必须只作用在当前这个 tab
+        final String tab = currentTab(root);
+        int[] ip = new int[2];
+        try { item.getLocationOnScreen(ip); } catch (Throwable ignored) {}
+        log("long press @" + (int) x + "," + (int) y + " -> " + title + " tab=" + tab
+                + " item@" + ip[0] + "," + ip[1] + " h=" + item.getHeight());
         sMain.post(new Runnable() {
-            public void run() { showRemoveDialog(title); }
+            public void run() { showRemoveDialog(title, tab); }
         });
+    }
+
+    // ---------------------------- tab 识别
+    // 「练过」顶部计数是「17节课程」，「想练」是「2 节想练的课程」。
+    // 用这个文案判断当前在哪个列表，比去猜 tab 的选中态稳得多。
+    static final String TAB_DONE = "done";   // 练过
+    static final String TAB_WANT = "want";   // 想练
+    static final String TAB_OTHER = "other";
+
+    static final java.util.regex.Pattern COUNT_PAT =
+            java.util.regex.Pattern.compile("^\\s*(\\d+)\\s*(节.*课程)\\s*$");
+
+    /** 找顶部「N 节课程 / N 节想练的课程」那个计数 TextView */
+    TextView findCountLabel(View root) {
+        final TextView[] found = {null};
+        findCountLabelIn(root, found, 0);
+        return found[0];
+    }
+
+    void findCountLabelIn(View v, TextView[] out, int depth) {
+        if (depth > 30 || out[0] != null) return;
+        if (v instanceof TextView) {
+            String t = String.valueOf(((TextView) v).getText()).trim();
+            if (t.length() < 3 || t.length() > 20) return;
+            if (COUNT_PAT.matcher(t).matches()) { out[0] = (TextView) v; return; }
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) findCountLabelIn(g.getChildAt(i), out, depth + 1);
+        }
+    }
+
+    String currentTab(View root) {
+        TextView t = findCountLabel(root);
+        if (t == null) return TAB_OTHER;
+        String s = String.valueOf(t.getText());
+        return s.contains("想练") ? TAB_WANT : TAB_DONE;
     }
 
     int dp(Activity a, float v) {
@@ -1128,7 +1267,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /** 和设置页一致的紫色圆角弹窗，别用系统默认的直角 AlertDialog */
-    void showRemoveDialog(final String title) {
+    void showRemoveDialog(final String title, final String tab) {
         final Activity a = sCur;
         if (a == null || a.isFinishing()) return;
         try {
@@ -1141,7 +1280,7 @@ public class MainHook implements IXposedHookLoadPackage {
             box.setPadding(pad, pad, pad, dp(a, 14));
 
             TextView h = new TextView(a);
-            h.setText("从「练过」里移除这门课？");
+            h.setText(TAB_WANT.equals(tab) ? "从「想练」里移除这门课？" : "从「练过」里移除这门课？");
             h.setTextSize(17);
             h.setTextColor(0xFF1A1A1A);
             h.setTypeface(android.graphics.Typeface.create("sans-serif-medium",
@@ -1162,7 +1301,6 @@ public class MainHook implements IXposedHookLoadPackage {
             desc.setLineSpacing(dp(a, 2), 1f);
             desc.setPadding(0, dp(a, 2), 0, dp(a, 18));
             box.addView(desc);
-
             LinearLayout btns = new LinearLayout(a);
             btns.setOrientation(LinearLayout.HORIZONTAL);
             btns.setGravity(android.view.Gravity.CENTER_VERTICAL);
@@ -1193,11 +1331,14 @@ public class MainHook implements IXposedHookLoadPackage {
             remove.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
                     loadHidden();
-                    sHiddenCourses.add(title);
+                    sHiddenCourses.add(hiddenKey(tab, title));
                     saveHidden();
                     Activity cur = sCur;
-                    if (cur != null) applyHidden(cur);
-                    log("hidden by user: " + title);
+                    if (cur != null) {
+                        applyHidden(cur);
+                        if (Cfg.syncCount) syncCountLabel(cur);
+                    }
+                    log("hidden by user: " + tab + "|" + title);
                     d.dismiss();
                 }
             });
@@ -1239,30 +1380,70 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { return false; }
     }
 
-    /** 找到触摸点下面的列表 item（RecyclerView 的直接子 View） */
+    /**
+     * 找到触摸点下面「某一行课程」的 View。
+     *
+     * 踩坑记录：Keep 用的是自定义的 PullRecyclerView，它把**所有课程行装在同一个
+     * 直接子 View 里**（实测那一个子 View 高 2376px，包含 5 门课）。所以
+     * "返回 RecyclerView 的直接子 View"永远只能拿到整个列表，标题也就永远是第一门
+     * —— 这就是"长按哪门都删第一门"的真正原因。
+     *
+     * 正确做法：在命中点下面往下递归，收集所有"可点击 + 含课程标题"的 View，
+     * 取高度最小的那个（最贴近单行）。容器高度很大，会被自然排除。
+     */
     View findListItem(View v, float x, float y) {
-        if (!(v instanceof ViewGroup)) return null;
+        View[] best = {null};
+        int[] bestH = {Integer.MAX_VALUE};
+        collectItemViews(v, x, y, best, bestH, 0);
+        return best[0];
+    }
+
+    void collectItemViews(View v, float x, float y, View[] best, int[] bestH, int depth) {
+        if (depth > 40 || !(v instanceof ViewGroup)) return;
         ViewGroup g = (ViewGroup) v;
-        boolean rv = g.getClass().getName().contains("RecyclerView");
         for (int i = 0; i < g.getChildCount(); i++) {
             View c = g.getChildAt(i);
-            // 被我们隐藏的 item 高度是 0，isShown 仍然是 true，必须额外判高度，
-            // 否则长按列表第一项会命中上面那门已经隐藏的课。
             if (!c.isShown() || c.getHeight() <= 0 || !hitRect(c, x, y)) continue;
-            if (rv) return c;
-            View r = findListItem(c, x, y);
-            if (r != null) return r;
+            if (c.isClickable()) {
+                TextView title = findTitleTextView(c);
+                if (title != null) {
+                    int h = c.getHeight();
+                    if (h < bestH[0]) { bestH[0] = h; best[0] = c; }
+                }
+            }
+            collectItemViews(c, x, y, best, bestH, depth + 1);
         }
-        return null;
+    }
+
+    /** 优先用 Keep 自己的 textName（课程名），找不到再退回"最靠上的 TextView" */
+    TextView findTitleTextView(View item) {
+        final TextView[] found = {null};
+        findTitleIn(item, found, 0);
+        return found[0];
+    }
+
+    void findTitleIn(View v, TextView[] out, int depth) {
+        if (depth > 20 || out[0] != null) return;
+        if (v instanceof TextView) {
+            if ("textName".equals(idName(v)) && v.isShown()) { out[0] = (TextView) v; return; }
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) findTitleIn(g.getChildAt(i), out, depth + 1);
+        }
     }
 
     /** item 里最靠上的文本就是课程标题（下面是「K1 零基础 2 分钟」「1 天前练过」） */
     String itemTitle(View item) {
-        final TextView[] best = {null};
-        final int[] bestY = {Integer.MAX_VALUE};
-        collectTitle(item, best, bestY);
-        if (best[0] == null) return null;
-        String t = String.valueOf(best[0].getText()).trim();
+        TextView tv = findTitleTextView(item);
+        if (tv == null) {
+            final TextView[] best = {null};
+            final int[] bestY = {Integer.MAX_VALUE};
+            collectTitle(item, best, bestY);
+            tv = best[0];
+        }
+        if (tv == null) return null;
+        String t = String.valueOf(tv.getText()).trim();
         return t.length() == 0 ? null : t;
     }
 
@@ -1286,45 +1467,108 @@ public class MainHook implements IXposedHookLoadPackage {
 
     void applyHidden(Activity a) {
         loadHidden();
-        if (sHiddenCourses.isEmpty()) return;
         View root = decor(a);
         if (root == null) return;
-        applyHiddenIn(root, 0);
+        String tab = currentTab(root);
+        applyHiddenIn(root, 0, tab);
     }
 
-    void applyHiddenIn(View v, int depth) {
-        if (depth > 30 || !(v instanceof ViewGroup)) return;
+    /**
+     * 隐藏「当前 tab 里被移除的课」。
+     *
+     * 关键：RecyclerView 会复用 item View，而 LayoutParams 是跟着 View 走的。
+     * 旧实现只把命中的 item 压成 height=0，这个 0 会留在被复用的 View 上 ——
+     * 于是"删掉第 3 门"之后，第 3 个 View 被回收去显示别的课，那门课也变 0 高，
+     * 看起来就是"删 A 结果 B 消失"、以及删完还显示"5 节课程"。
+     * 所以每轮扫描对**没被移除的 item 也要主动恢复**成 WRAP_CONTENT + VISIBLE。
+     */
+    void applyHiddenIn(View v, int depth, final String tab) {
+        if (depth > 40 || !(v instanceof ViewGroup)) return;
         ViewGroup g = (ViewGroup) v;
-        boolean rv = g.getClass().getName().contains("RecyclerView");
+        int screenH = g.getResources().getDisplayMetrics().heightPixels;
+        int rowMax = (int) (screenH * 0.40f);
         for (int i = 0; i < g.getChildCount(); i++) {
             View c = g.getChildAt(i);
-            if (rv && c.isClickable() && c.getVisibility() == View.VISIBLE) {
-                String t = itemTitle(c);
-                if (t != null && sHiddenCourses.contains(t)) {
-                    c.setVisibility(View.GONE);
-                    // 光 GONE 在 RecyclerView 里会留一条空位，把高度也压成 0 才会真正收起来
+            if (!c.isShown() || c.getHeight() <= 0) continue;
+            // 只把"一行课程"当处理对象：可点击 + 有 textName + 高度不像整个列表
+            // （PullRecyclerView 的唯一子 View 高 2376px，装了 5 门课，必须排除）
+            if (c.isClickable() && c.getHeight() <= rowMax) {
+                TextView tv = findTitleTextView(c);
+                if (tv != null) {
+                    String t = String.valueOf(tv.getText()).trim();
+                    boolean hide = t.length() > 0 && isHidden(tab, t);
                     ViewGroup.LayoutParams lp = c.getLayoutParams();
-                    if (lp != null && lp.height != 0) {
-                        lp.height = 0;
-                        c.setLayoutParams(lp);
+                    if (hide) {
+                        if (c.getVisibility() != View.GONE) c.setVisibility(View.GONE);
+                        if (lp != null && lp.height != 0) {
+                            lp.height = 0;
+                            c.setLayoutParams(lp);
+                        }
+                    } else {
+                        // RecyclerView 复用会把 0 高度带回来，必须主动还原
+                        if (c.getVisibility() != View.VISIBLE) c.setVisibility(View.VISIBLE);
+                        if (lp != null && lp.height == 0) {
+                            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+                            c.setLayoutParams(lp);
+                        }
                     }
-                    log("hidden: " + t);
                 }
             }
-            applyHiddenIn(c, depth + 1);
+            applyHiddenIn(c, depth + 1, tab);
+        }
+    }
+
+    /**
+     * 顶部「N 节课程 / N 节想练的课程」的计数同步。
+     * Keep 的列表数据来自接口，我们只在本地隐藏 item，它自己的计数不会变，
+     * 所以要按"原始数 - 当前 tab 已移除数"重写这个 TextView。
+     * 原始数在每个页面实例第一次看到时记下来，避免反复减。
+     */
+    static java.lang.ref.WeakReference<Activity> sCountAct = null;
+    static int sCountOrig = -1;
+    static String sCountSuffix = null;
+    static String sCountTab = null;
+
+    void syncCountLabel(Activity a) {
+        View root = decor(a);
+        if (root == null) return;
+        TextView lab = findCountLabel(root);
+        if (lab == null) return;
+        String tab = currentTab(root);
+        String cur = String.valueOf(lab.getText()).trim();
+        java.util.regex.Matcher m = COUNT_PAT.matcher(cur);
+        if (!m.matches()) return;
+
+        Activity prev = sCountAct == null ? null : sCountAct.get();
+        if (prev != a || sCountTab == null || !sCountTab.equals(tab)) {
+            // 换页面 / 换 tab：以当前显示的数为基准
+            sCountAct = new java.lang.ref.WeakReference<Activity>(a);
+            sCountTab = tab;
+            sCountOrig = Integer.parseInt(m.group(1));
+            sCountSuffix = m.group(2);
+        }
+        int hidden = 0;
+        String prefix = tab + "|";
+        for (String k : sHiddenCourses) if (k.startsWith(prefix)) hidden++;
+        int shown = sCountOrig - hidden;
+        if (shown < 0) shown = 0;
+        String want = shown + (sCountSuffix == null ? "节课程" : sCountSuffix);
+        if (!want.equals(cur)) {
+            lab.setText(want);
+            log("count: " + cur + " -> " + want + " (hidden=" + hidden + ", tab=" + tab + ")");
         }
     }
 
     /** 列表会滚动复用，隐藏过的 item 重新绑定时要再压一次。7 秒内持续扫 */
     void armHiddenScan(final Activity a) {
         loadHidden();
-        if (sHiddenCourses.isEmpty()) return;
         sHiddenScanStep = 0;
         sMain.post(new Runnable() {
             public void run() {
                 Activity cur = sCur;
                 if (cur == null || !COURSE.equals(cur.getClass().getName())) return;
                 applyHidden(cur);
+                if (Cfg.syncCount) syncCountLabel(cur);
                 if (++sHiddenScanStep < 12) sMain.postDelayed(this, 600);
             }
         });
@@ -1458,6 +1702,7 @@ public class MainHook implements IXposedHookLoadPackage {
         sDetailEnterT = now;
         sLastTouch = now;
         installTouchSpy(a);
+        armAutoWant(a);
 
         // 刚练完回到详情页（点红色方块结束、或从总结页返回）绝不能再自动开练，
         // 否则就成"练完→回详情页→2 秒→又被推进训练"的死循环。
@@ -1501,6 +1746,87 @@ public class MainHook implements IXposedHookLoadPackage {
         // 实测 4.5~6 秒才真正进训练。用户要的是"2 秒就进去"，下载完全可以晚点做。
         // 现在的顺序是：2 秒 → 进训练（训练时 Keep 自己边播边缓存）
         // → 练完入队 → 回到列表页时由队列泵补下并核对 download.db。
+    }
+
+    // ---------------------------- 自动加入「想练」
+    /**
+     * 详情页底部左侧有一个「想练」图标。用户希望"点进课程就自动进想练列表"，
+     * 所以新一次进入详情时看一眼那个按钮：文案正好是「想练」（未加入）才点，
+     * 已经是「已想练 / 取消想练」就跳过，免得把用户已经加过的取消掉。
+     * 同一门课在一次进程里只尝试一次。
+     */
+    static String sWantDoneCid = null;
+
+    void armAutoWant(final Activity a) {
+        if (!Cfg.autoWant) return;
+        final String cid = sDetailCourseId;
+        if (cid != null && cid.equals(sWantDoneCid)) return;
+        sMain.postDelayed(new Runnable() {
+            public void run() {
+                if (sCur != a || a.isFinishing()) return;
+                View root = decor(a);
+                if (root == null) return;
+                View btn = findWantButton(root, a, 0);
+                if (btn == null) { log("auto-want: button not found"); return; }
+                String label = wantLabel(btn);
+                if (!"想练".equals(label)) {
+                    log("auto-want: already '" + label + "', skip");
+                    sWantDoneCid = cid;
+                    return;
+                }
+                boolean ok = clickDeep(btn);
+                log("auto-want: click '" + label + "' ok=" + ok);
+                if (ok) sWantDoneCid = cid;
+            }
+        }, 900);
+    }
+
+    /** 只在屏幕下半部分找「想练」，避免命中正文里同名的推荐文案 */
+    View findWantButton(View v, Activity a, int depth) {
+        if (depth > 30 || !(v instanceof ViewGroup)) return null;
+        int screenH = a.getResources().getDisplayMetrics().heightPixels;
+        ViewGroup g = (ViewGroup) v;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            String label = wantLabel(c);
+            if (label != null && c.isShown()) {
+                int[] p = new int[2];
+                try { c.getLocationOnScreen(p); } catch (Throwable ignored) { p[1] = 0; }
+                if (p[1] > screenH * 0.55f) {
+                    View clickable = nearestClickable(c);
+                    if (clickable != null) return clickable;
+                }
+            }
+            View r = findWantButton(c, a, depth + 1);
+            if (r != null) return r;
+        }
+        return null;
+    }
+
+    String wantLabel(View v) {
+        if (v instanceof TextView) {
+            String t = String.valueOf(((TextView) v).getText()).trim();
+            if ("想练".equals(t) || "加入想练".equals(t) || "已想练".equals(t)
+                    || "取消想练".equals(t)) return t;
+        }
+        try {
+            CharSequence d = v.getContentDescription();
+            if (d != null) {
+                String s = String.valueOf(d).trim();
+                if (s.contains("加入想练") || s.equals("想练")) return "想练";
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    View nearestClickable(View v) {
+        View cur = v;
+        for (int i = 0; i < 4 && cur != null; i++) {
+            if (cur.isClickable()) return cur;
+            android.view.ViewParent p = cur.getParent();
+            cur = (p instanceof View) ? (View) p : null;
+        }
+        return v;
     }
 
     void onTraining(final Activity a) {

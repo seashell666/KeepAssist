@@ -4,7 +4,7 @@
 
 它把「打开 Keep → 找到课 → 点开始」这一串操作压到最少：跳过开屏广告、启动直接到「我的课程 → 练过」、进详情页 2 秒不动就开练、训练中自动息屏、练完自动回到列表并把课补下载好。全部行为可在设置页配置。
 
-> **当前版本 v2.2**（`versionName=2.2`，`versionCode=13`，2026-11-22）
+> **当前版本 v2.3**（`versionName=2.3`，`versionCode=14`，2026-11-23）
 > 实测环境：小米 11 / Android 13 / MIUI / Keep 9.1.110 / Magisk 28.1 / Vector
 > 需要 **root** 与 Xposed 框架，作用域仅限 Keep。
 
@@ -22,12 +22,14 @@
 | 练过自动下载 | 练完入队，回到列表且停手后补下；已下载的课直接跳过 |
 | 弹窗/广告 | Hook `Dialog.show` / `PopupWindow` / `startActivity`，按特征自动处理 |
 | 练完收尾 | 自动点「完成」、关分享页、把岔路拉回「练过」 |
-| 长按移除 | 长按课程项从「练过」隐藏 |
+| 长按移除 | 长按课程项从当前列表隐藏；「练过 / 想练」互不影响，顶部数量同步 |
 | 长按打开设置 | 按住「我的课程」**整条标题栏** 0.7 秒，标题变红 `#D2525E` |
+| 返回回主页 | 课程页按返回 / 右滑回 MainActivity，不再直接退出 App |
+| 自动加想练 | 可开关：进课程详情时自动点一次「想练」 |
 
 ## 安装
 
-从 [Releases](https://github.com/seashell666/KeepAssist/releases) 下载 `KeepAssist-Magisk-v2.2.zip`（推荐，自动装 APK 并配置 root 权限）或 `KeepAssist-v2.2.apk`：
+从 [Releases](../../releases) 下载 `KeepAssist-Magisk-v2.3.zip`（推荐，自动装 APK 并配置 root 权限）或 `KeepAssist-v2.3.apk`：
 
 1. 刷入 Magisk 包，或手动安装 APK
 2. Vector / LSPosed 管理器 → 模块 → 启用「Keep 助手」
@@ -74,6 +76,9 @@ EOF
 | `auto_download` | 1 | 练过的课自动补下载 |
 | `wifi_only` | 1 | 只在 Wi-Fi 下自动下载 |
 | `checked_days` | 7 | 下载状态复检周期（天，0=只确认一次） |
+| `hide_course` | 1 | 长按课程从列表移除（总开关） |
+| `sync_count` | 1 | 移除后同步顶部「N 节课程」数量 |
+| `auto_want` | 0 | 打开课程详情时自动点一次「想练」 |
 
 ## 文档
 
@@ -86,6 +91,8 @@ EOF
 
 - 自动开练的 2 秒是「无操作」的 2 秒，加上 Keep 启动训练页约 1~1.5 秒，实际看到训练画面约 3~3.5 秒。
 - 已练过但只缓存了一星半点的历史课补不回来：Keep 对「已下载」是幂等的，模块无法强制重下。
+- 「自动加入想练」依赖详情页底部的「想练」按钮；Keep 改版换掉按钮时先在设置里关掉。
+- 列表移除是本地隐藏（`keepassist.xml` 的 `hidden_courses`，按 `tab|标题` 存），Keep 服务端数据不变。
 - 设置页不跟随系统深色模式，开关为自绘控件；权限类弹窗一律留给用户自己点。
 - 连不上某个已保存的 Wi-Fi 与本模块无关：模块只在 Keep 进程内只读查询网络状态，不申请任何权限、不调用 `WifiManager` 的写操作。
 
