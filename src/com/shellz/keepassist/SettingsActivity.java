@@ -1,12 +1,18 @@
 package com.shellz.keepassist;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -49,7 +55,13 @@ public class SettingsActivity extends Activity {
     Pill swHide, swCount, swWant;
     SeekBar sbDelay, sbSleep, sbVol;
     EditText etDays;
-    TextView tvDelay, tvSleep, tvVol, tvStatus;
+    TextView tvDelay, tvSleep, tvVol, tvStatus, tvVolNow;
+
+    // 改一下就自动保存：不用再滚到底下找「保存」按钮
+    final Handler sAuto = new Handler(Looper.getMainLooper());
+    boolean sAutoPending = false;
+    /** 配置回填控件期间不保存，避免把半成品写回去 */
+    boolean sLoaded = false;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -60,6 +72,44 @@ public class SettingsActivity extends Activity {
         } catch (Throwable ignored) {}
         setContentView(buildUi());
         load();
+        refreshNowVol();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshNowVol();
+    }
+
+    /** 读系统当前媒体音量，显示在卡片上（百分比按最大档换算） */
+    void refreshNowVol() {
+        try {
+            if (tvVolNow == null) return;
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            int cur = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int pct = max <= 0 ? 0 : Math.round(cur * 100f / max);
+            tvVolNow.setText("系统当前音量：" + pct + "%（" + cur + "/" + max + "）");
+        } catch (Throwable t) {
+            if (tvVolNow != null) tvVolNow.setText("系统当前音量：读不到（" + t.getClass().getSimpleName() + "）");
+        }
+    }
+
+    /** 立刻把媒体音量设成目标值：先用 API，再走 root 兜底（MIUI 上 API 有时会被忽略） */
+    void applyMediaVolume(final int index) {
+        try {
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) am.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0);
+        } catch (Throwable ignored) {}
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    Runtime.getRuntime().exec(new String[]{"su", "-c",
+                            "cmd media_session volume --stream 3 --set " + index});
+                } catch (Throwable ignored) {}
+            }
+        }, "KeepAssist-vol").start();
     }
 
     // ------------------------------------------------------------ 视觉工具
@@ -100,6 +150,7 @@ public class SettingsActivity extends Activity {
     /** 自绘胶囊开关：系统 Switch 的 track tint 在 MIUI 上不生效，而且圆点太大看不出状态 */
     class Pill extends View implements View.OnClickListener {
         boolean checked;
+        Runnable onChange;
         final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
         final android.graphics.RectF rect = new android.graphics.RectF();
 
@@ -114,7 +165,11 @@ public class SettingsActivity extends Activity {
         public void onClick(View v) {
             checked = !checked;
             invalidate();
+            if (onChange != null) onChange.run();
         }
+
+        /** 用户点一下之后回调（程序里 setChecked 不触发，回填配置时不会误保存） */
+        void setOnChange(Runnable r) { onChange = r; }
 
         boolean isChecked() { return checked; }
 
@@ -211,7 +266,7 @@ public class SettingsActivity extends Activity {
         TextView h1 = text("设置", 30f, C_TEXT, true);
         h1.setPadding(0, dp(6), 0, dp(4));
         root.addView(h1);
-        root.addView(text("保存后最多 15 秒生效，不用重启 Keep。", 12.5f, C_SUB, false));
+        root.addView(text("改一下就自动保存，不用点按钮。音量立刻生效，其余最多 15 秒生效。", 12.5f, C_SUB, false));
 
         // ---------------- 训练
         root.addView(groupLabel("训练"));
@@ -231,7 +286,7 @@ public class SettingsActivity extends Activity {
                 tvDelay.setText((p + 1) + " 秒");
             }
             public void onStartTrackingTouch(SeekBar sb) {}
-            public void onStopTrackingTouch(SeekBar sb) {}
+            public void onStopTrackingTouch(SeekBar sb) { autoSave(); }
         });
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -260,7 +315,7 @@ public class SettingsActivity extends Activity {
                 if (fromUser && swVolFollow.isChecked()) swVolFollow.setChecked(false);
             }
             public void onStartTrackingTouch(SeekBar sb) {}
-            public void onStopTrackingTouch(SeekBar sb) {}
+            public void onStopTrackingTouch(SeekBar sb) { autoSave(); }
         });
         LinearLayout.LayoutParams vsp = new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -300,6 +355,15 @@ public class SettingsActivity extends Activity {
         });
         followRow.addView(swVolFollow);
         c2.addView(followRow);
+
+        // 让卡片"看得见效果"：直接显示系统当前媒体音量，保存后立刻刷新。
+        // 之前只写配置文件、要等 Keep 那边 15 秒后才应用，用起来就像"没接上"。
+        tvVolNow = text("系统当前音量：读取中…", 12f, C_SUB, false);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        nlp.topMargin = dp(10);
+        tvVolNow.setLayoutParams(nlp);
+        c2.addView(tvVolNow);
         root.addView(c2);
 
         swSleep = toggle(true);
@@ -318,7 +382,7 @@ public class SettingsActivity extends Activity {
                 swSleep.setChecked(p > 0);
             }
             public void onStartTrackingTouch(SeekBar sb) {}
-            public void onStopTrackingTouch(SeekBar sb) {}
+            public void onStopTrackingTouch(SeekBar sb) { autoSave(); }
         });
         LinearLayout.LayoutParams slp2 = new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -376,7 +440,7 @@ public class SettingsActivity extends Activity {
         // ---------------- 列表（放在最后，不占关键开关的位置）
         root.addView(groupLabel("列表"));
 
-        swHide = toggle(true);
+        swHide = toggle(false);   // 默认关：练过列表交还 Keep 官方，别一保存就写 hide_course=1
         LinearLayout c7 = card();
         c7.addView(head("RM", "长按课程移除",
                 "在「练过 / 想练」里按住课程 0.55 秒，确认后只在列表里隐藏", swHide));
@@ -417,7 +481,8 @@ public class SettingsActivity extends Activity {
         reset.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 applyValues(true, 2, 7, 7);
-                tvStatus.setText("已恢复默认值，点「保存」写入。");
+                autoSave();
+                tvStatus.setText("已恢复默认值，正在保存…");
             }
         });
         root.addView(reset);
@@ -426,6 +491,16 @@ public class SettingsActivity extends Activity {
         tvStatus.setGravity(Gravity.CENTER);
         tvStatus.setPadding(0, dp(6), 0, 0);
         root.addView(tvStatus);
+
+        // 所有开关 / 滑块 / 输入框：改一下就自动保存，用户不用再滚到底下找按钮
+        final Runnable auto = new Runnable() { public void run() { autoSave(); } };
+        Pill[] pills = {swAutoGo, swVol, swSleep, swAutoDl, swWifi, swVolFollow, swHide, swCount, swWant};
+        for (int i = 0; i < pills.length; i++) pills[i].setOnChange(auto);
+        etDays.addTextChangedListener(new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            public void afterTextChanged(Editable s) { autoSave(); }
+        });
 
         return sc;
     }
@@ -445,9 +520,10 @@ public class SettingsActivity extends Activity {
                         }
                         applyValues(false, 2, 7, 7);
                         parseInto(s);
+                        sLoaded = true;
                         tvStatus.setText(s.trim().length() == 0
-                                ? "当前是默认配置（配置文件尚未创建）。"
-                                : "已读取当前配置。");
+                                ? "当前是默认配置，改动会自动保存。"
+                                : "已读取当前配置，改动会自动保存。");
                     }
                 });
             }
@@ -467,7 +543,7 @@ public class SettingsActivity extends Activity {
             swSleep.setChecked(true);
             swAutoDl.setChecked(true);
             swWifi.setChecked(true);
-            swHide.setChecked(true);
+            swHide.setChecked(false);
             swCount.setChecked(true);
             swWant.setChecked(true);
             sbDelay.setProgress(delay - 1);
@@ -526,7 +602,26 @@ public class SettingsActivity extends Activity {
         catch (Throwable t) { return 7; }
     }
 
-    void save() {
+    final Runnable autoSaveRunnable = new Runnable() {
+        public void run() { sAutoPending = false; save(true); }
+    };
+
+    /** 改动即保存：0.42 秒合并一次，连续拖滑块只写一遍 */
+    void autoSave() {
+        if (!sLoaded) return;          // 配置回填期间不写，否则会把半成品先写进去
+        sAutoPending = true;
+        sAuto.removeCallbacks(autoSaveRunnable);
+        sAuto.postDelayed(autoSaveRunnable, 420);
+    }
+
+    void save() { save(false); }
+
+    /**
+     * 写配置。
+     * auto=true 是"用户刚动了一下控件"触发的自动保存：不显示"正在保存"，
+     * 完成后在底部提示"已自动保存"，音量同时立刻生效。
+     */
+    void save(final boolean auto) {
         final String content = "# Keep 助手配置（设置界面生成）\n"
                 + "auto_go=" + (swAutoGo.isChecked() ? 1 : 0) + "\n"
                 + "auto_go_delay=" + (sbDelay.getProgress() + 1) + "\n"
@@ -541,15 +636,31 @@ public class SettingsActivity extends Activity {
                 + "sync_count=" + (swCount.isChecked() ? 1 : 0) + "\n"
                 + "auto_want=" + (swWant.isChecked() ? 1 : 0) + "\n";
 
-        tvStatus.setText("正在保存…");
+        final boolean lockOn = swVol.isChecked();
+        final boolean followOn = swVolFollow.isChecked();
+        final int target = clamp(Math.round(sbVol.getProgress() * 1.5f), 0, 150);
+        if (!auto) tvStatus.setText("正在保存…");
         new Thread(new Runnable() {
             public void run() {
                 final boolean ok = writeConf(content);
+                // 保存完立刻把音量落实，别让用户等 15 秒还以为没生效
+                if (ok && lockOn && !followOn) applyMediaVolume(target);
                 runOnUiThread(new Runnable() {
                     public void run() {
-                        tvStatus.setText(ok
-                                ? "已保存。Keep 里最多 15 秒后生效（不用重启）。"
-                                : "保存失败：没有 root 权限，或 /data/adb 不可写。");
+                        refreshNowVol();
+                        if (!ok) {
+                            tvStatus.setText("保存失败：没有 root 权限，或 /data/adb 不可写。");
+                            return;
+                        }
+                        if (auto) {
+                            tvStatus.setText(lockOn && !followOn
+                                    ? "已自动保存 · 音量 " + Math.round(target * 100f / 150) + "%"
+                                    : "已自动保存");
+                        } else {
+                            tvStatus.setText(lockOn && !followOn
+                                    ? "已保存，音量已设为 " + Math.round(target * 100f / 150) + "%。"
+                                    : "已保存。Keep 里最多 15 秒后生效（不用重启）。");
+                        }
                     }
                 });
             }

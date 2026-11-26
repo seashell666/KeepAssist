@@ -2,10 +2,40 @@
 
 `versionName` 与 `versionCode` 以 `AndroidManifest.xml` 为准。每个版本的详细设计说明见 [完整文档](./README.md) 对应章节。
 
-> 说明：v1.8 起才有明确的 `versionCode` 记录（9），之后的 10 / 11 / 12 / 13 / 14 依次对应 v1.9 / v2.0 / v2.1 / v2.2 / v2.3。
+> 说明：v1.8 起才有明确的 `versionCode` 记录（9），之后的 10 / 11 / 12 / 13 / 14 / 15 依次对应 v1.9 / v2.0 / v2.1 / v2.2 / v2.3 / v2.4。
 > v1.3 ~ v1.7 属于早期开发阶段，未保留独立的版本号记录，下面按功能章节归并列出。
 
-## v2.3 · versionCode 14 · 2026-11-23（当前版本）
+## v2.4 · versionCode 15 · 2026-11-26（当前版本）
+
+设置页改成改一下自动保存、下载面板彻底不再出现，另修退出后音量不还原等 9 项。
+
+**修复**
+
+- **设置页全面自动保存**：以前所有改动必须点最下面的「保存」才落盘（音量拖到 67%，
+  退出再进又变回 0%）。现在 Pill / SeekBar / etDays 任何改动 → `autoSave()`（420ms 合并）
+  → 写 conf，音量同时立即生效；`Pill` 新增 `onChange` 回调（`setChecked` 不触发，回填不误存）；
+  `sLoaded` 门闩防回填期写半成品。保存按钮保留可手动确认。
+- **下载面板真正不可见**：`hookDialog` 的 after 不再立刻用 findViewById 判断（那一刻内容未
+  inflate，判定必败 → 紧跟 `showPanel` 恢复可见 → 屏幕闪一下）。改为 520ms 后复判：
+  `sDlBusy || isDownloadPanel(d)` → 继续 `hidePanel`，否则才恢复。
+- **退出 Keep 还原音量**：新增 `static int sVolRestore`，`startVolSession` 记进入前真实音量，
+  `stopVolSession` 还回去（实测 75 → 0 → 回桌面 75）。
+- **隐藏课程整体停用**：`Cfg.hideCourse` 默认 false，`applyHidden`/`syncCountLabel` 提前 return；
+  设备 prefs 里 5 条 `hidden_courses` 已清空；设置页「长按课程移除」默认关，保存不再写 `hide_course=1`。
+- **自动开练提速**：`armIdle` 的 auto-GO hold 上限 3→1 秒；`tryWant` 的「已想练，skip」分支补
+  `sWantBusy=false`。实测 armed → try#1 间隔 2014ms。
+- **下载判定只认 `download.db`**：本地碎片不算已下载（只打 `partial cache`）；
+  `checkedFresh` 分支不再阻断重试。
+- **下载泵屏幕灭不放弃**：训练优先判断；屏幕灭前 3 次 4 秒快试，之后每 20 秒等亮屏。
+- **音量接管（保险）**：新增 `hookVolume()` 拦 `AudioManager.setStreamVolume/adjustStreamVolume`，
+  当前 Keep 9.1.110 不抢音量（`vol: keep asked` 未出现）。
+- **设置页音量卡可感知**：新增「系统当前音量：X%（cur/max）」，onResume 与保存后刷新。
+
+**兼容**
+
+- 签名不变（`5c74c435…`），v2.3 可直接覆盖升级，无需清数据。
+
+## v2.3 · versionCode 14 · 2026-11-23
 
 修掉三个列表相关的真 bug，并新增三个开关（放在设置页最底部）。
 

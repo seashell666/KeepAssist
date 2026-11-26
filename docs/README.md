@@ -1,6 +1,6 @@
 # Keep 助手 (KeepAssist)
 
-> **当前版本 v2.3**（`versionCode=14`，2026-11-23）
+> **当前版本 v2.4**（`versionCode=15`，2026-11-26）
 > 实测环境：小米 11 / Android 13 / MIUI / Keep 9.1.110 / Magisk 28.1 / Vector
 > 安装包见 GitHub Releases；版本历史见 [CHANGELOG.md](../CHANGELOG.md)，本次发布说明见 [RELEASE_NOTES.md](../RELEASE_NOTES.md)。
 
@@ -799,6 +799,37 @@ Vector 管理器会把模块图标缓存在**管理器进程内存**里。覆盖
 
 ---
 
+## v2.4：设置页自动保存 + 下载面板彻底消失 + 退出还原音量
+
+这一版全是「用起来别扭」的修复，没有新功能。
+
+### 1. 设置页改一下就自动保存
+
+旧版所有改动只停在界面上，必须点最下面的「保存」才写 conf —— 音量拖到 67%、退出再进
+又回到 0%，用户体感就是"设置没记住"。
+
+现在 `Pill` / `SeekBar` / `etDays` 任何改动触发 `autoSave()`（420ms 合并写），
+音量改动同时走 `AudioManager` + root `cmd media_session volume` 立刻生效；
+`Pill` 加了 `onChange` 回调（`setChecked` 不触发，回填配置时不会误存），
+`sLoaded` 门闩挡住 onResume 回填期间的半成品写盘。
+
+### 2. 下载面板 520ms 复判
+
+旧版 `hookDialog` 的 after 立刻 findViewById 判断是不是下载面板 —— 那一刻
+dialog 内容还没 inflate，判定必败 → 紧跟的 `showPanel` 恢复可见 → 屏幕一闪。
+
+改为 520ms 后复判：`sDlBusy || isDownloadPanel(d)` 才继续 `hidePanel`。
+
+### 3. 退出 Keep 还原音量
+
+`startVolSession` 记进入前真实音量（`sVolRestore`），`stopVolSession` 退出时还回去，
+不再把系统音量留在压低值上。
+
+其余细节（隐藏课程停用、自动开练提速到 2014ms、下载判定只认 `download.db`、
+屏幕灭不放弃下载、`hookVolume` 保险）见 `RELEASE_NOTES.md` v2.4 段。
+
+---
+
 ## v2.3：修掉「返回退出 App」和「长按删错课」+ 列表开关
 
 ### 1. 课程页按返回不再退出 App
@@ -967,8 +998,8 @@ pump: queue empty, done              ← 没有打开详情页，列表没跳
 
 ### 换机 / 重装
 
-1. 刷入 `KeepAssist-Magisk-v2.3.zip`（会自动装 APK + 配置 su 权限）
-   或手动安装 `KeepAssist-v2.3.apk`
+1. 刷入 `KeepAssist-Magisk-v2.4.zip`（会自动装 APK + 配置 su 权限）
+   或手动安装 `KeepAssist-v2.4.apk`
 2. 打开 Vector / LSPosed 管理器 → 模块 → 启用「Keep 助手」
 3. 作用域勾选 **Keep (`com.gotokeep.keep`)**
 4. 强制停止 Keep 再打开

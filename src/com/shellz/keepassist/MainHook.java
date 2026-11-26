@@ -72,6 +72,12 @@ public class MainHook implements IXposedHookLoadPackage {
     static Handler  sMain;
     static Context  sCtx;
     static Activity sCur;
+    /**
+     * 上一个前台页面。用来区分「这门课是从哪进来的」：
+     * 从「我的课程 / 想练」点进来 = 要练；
+     * 从「搜索」点进来 = 只是在挑课、加想练，绝不能自动开练。
+     */
+    static String sPrevActName = null;
     static long     sBootT = 0;
     static volatile boolean sColdNavDone = false;
     /**
@@ -104,6 +110,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /** 无操作计时：最后一次触摸的时刻 + 当前待执行的空闲任务（详情页/训练页共用） */
     static long sLastTouch = 0;
+    /**
+     * 自动加想练是否还在处理中。
+     * performClick 对这种自绘按钮经常"返回 true 但没反应"，需要补真实触摸并多等一会儿；
+     * 这段时间里不能点 GO 跑掉（否则想练根本没加上）。
+     */
+    static boolean sWantBusy = false;
+    /** 为了等加想练而顺延自动 GO 的次数上限，防死等 */
+    static int sWantHoldCnt = 0;
     static Runnable sIdleTask;
     /** 这一次进入详情页是否已经点过 GO，避免重复触发 */
     static boolean sGoTapped = false;
@@ -135,6 +149,8 @@ public class MainHook implements IXposedHookLoadPackage {
     // ---- 媒体音量锁：进入 Keep 前台时以当时的音量为基准，会话内被改动就拉回来
     /** 当前会话的音量基准，-1 表示不在会话里 */
     static int  sVolBaseline = -1;
+    /** 进 Keep 之前的系统真实音量，离开 Keep 时要还回去；-1 = 还没记 */
+    static int  sVolRestore = -1;
     static Runnable sVolTask;
     /** 音量轮询间隔 */
     static final long VOL_POLL_MS = 1200;
@@ -234,8 +250,8 @@ public class MainHook implements IXposedHookLoadPackage {
         static volatile boolean autoDl     = true;
         static volatile boolean wifiOnly   = true;
         static volatile int     checkDays  = 7;
-        /** 长按课程从列表移除（总开关） */
-        static volatile boolean hideCourse = true;
+        /** 长按课程从列表移除（总开关）。用户明确说：三个点里自己就能删课，不需要模块代劳，默认关 */
+        static volatile boolean hideCourse = false;
         /** 移除后同步顶部的「N 节课程」数量 */
         static volatile boolean syncCount  = true;
         /**
@@ -380,9 +396,11 @@ public class MainHook implements IXposedHookLoadPackage {
         Cfg.refresh();
         hookCreate();
         hookResume();
+        hookTrainingPause();
         hookBack();
         hookNewIntent();
         hookDialog();
+        hookVolume();
         hookPopup();
         hookStartActivity();
         hookTouch();
@@ -542,6 +560,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (!KEEP.equals(a.getPackageName())) return;
                     ensureMain();
                     sCtx = a.getApplicationContext();
+                    if (sCur != null && sCur != a) sPrevActName = sCur.getClass().getName();
                     sCur = a;
                     Cfg.refresh();     // 15 秒节流，改了配置最多等这么久生效
                     markResumed(a);
@@ -630,6 +649,39 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
         } catch (Throwable t) { log("hookResume fail " + t); }
+    }
+
+    /**
+     * 训练页 onPause = 用户离开训练（按返回退桌面、切后台、被总结页顶掉）。
+     *
+     * 只靠"下一个页面 onResume"判断训练结束是不够的：用户按返回直接退到桌面时，
+     * Keep 没有任何页面 resume，我们的 sInTraining 一直是 true，"训练结束 → 入队下载"
+     * 这条信号就丢了 —— 实测"练了 2 秒退出，完全没下载"就是这么来的。
+     */
+    void hookTrainingPause() {
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    Activity a = (Activity) p.thisObject;
+                    if (!KEEP.equals(a.getPackageName())) return;
+                    String cn = a.getClass().getName();
+                    if (!cn.contains("TrainingActivity") && !cn.contains("TrainingEngineActivity")
+                            && !cn.contains("training.core")) return;
+                    if (!sInTraining) return;
+                    // 息屏不是"练完了"。屏幕灭了只是看不见，Keep 那边还在跑，
+                    // 这里一旦标成结束，就会误判（也会让下载队列提前跑）。
+                    if (!screenIsOn()) {
+                        log("training pause by screen-off -> keep running");
+                        return;
+                    }
+                    sInTraining = false;
+                    sTrainingEnd = SystemClock.uptimeMillis();
+                    sTrainingEndCid = sTrainingCourseId;
+                    log("training paused -> treated as end");
+                    markTrainedCourseForDownload();
+                }
+            });
+        } catch (Throwable t) { log("hookTrainingPause " + t); }
     }
 
     /** 进程已在后台时，从桌面再点图标也落到课程页 */
@@ -1470,9 +1522,12 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     void applyHidden(Activity a) {
+        if (!Cfg.hideCourse) return;   // 隐藏功能整体停用，练过列表交还 Keep 官方（可自己点"…"删课）
         loadHidden();
         View root = decor(a);
         if (root == null) return;
+        sHiddenApplied = 0;
+        sRowsVisible = 0;
         String tab = currentTab(root);
         applyHiddenIn(root, 0, tab);
     }
@@ -1503,12 +1558,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     boolean hide = t.length() > 0 && isHidden(tab, t);
                     ViewGroup.LayoutParams lp = c.getLayoutParams();
                     if (hide) {
+                        sHiddenApplied++;
                         if (c.getVisibility() != View.GONE) c.setVisibility(View.GONE);
                         if (lp != null && lp.height != 0) {
                             lp.height = 0;
                             c.setLayoutParams(lp);
                         }
                     } else {
+                        sRowsVisible++;
                         // RecyclerView 复用会把 0 高度带回来，必须主动还原
                         if (c.getVisibility() != View.VISIBLE) c.setVisibility(View.VISIBLE);
                         if (lp != null && lp.height == 0) {
@@ -1532,8 +1589,19 @@ public class MainHook implements IXposedHookLoadPackage {
     static int sCountOrig = -1;
     static String sCountSuffix = null;
     static String sCountTab = null;
+    /**
+     * 本屏扫描里真正被压掉的课程行数。
+     * 以前是按「hidden 名单里属于本 tab 的条数」算的 —— 名单里只要有一条
+     * 不在当前列表（比如已被 Keep 自己删掉、或在别的 tab），就会多减一个，
+     * 于是出现「显示 1 节课程，下面明明两条」。
+     * 现在只按屏幕上真正 GONE 掉的行来减，账才对得上。
+     */
+    static int sHiddenApplied = 0;
+    /** 本屏扫描里真正还看得见的课程行数（用来对齐顶部计数） */
+    static int sRowsVisible = 0;
 
     void syncCountLabel(Activity a) {
+        if (!Cfg.hideCourse) return;   // 不再隐藏课程，顶部计数就用 Keep 官方原值
         View root = decor(a);
         if (root == null) return;
         TextView lab = findCountLabel(root);
@@ -1551,10 +1619,16 @@ public class MainHook implements IXposedHookLoadPackage {
             sCountOrig = Integer.parseInt(m.group(1));
             sCountSuffix = m.group(2);
         }
-        int hidden = 0;
-        String prefix = tab + "|";
-        for (String k : sHiddenCourses) if (k.startsWith(prefix)) hidden++;
-        int shown = sCountOrig - hidden;
+        int hidden = sHiddenApplied;
+        if (hidden <= 0) {
+            // 还没扫过（或本屏没有可隐藏的行）时，退回按名单估算
+            hidden = 0;
+            String prefix = tab + "|";
+            for (String k : sHiddenCourses) if (k.startsWith(prefix)) hidden++;
+        }
+        // 屏幕上真正看得见的行数最可信：Keep 自己报的总数本身就可能是错的
+        // （它算 6，实际列表 7 条），只按它减就会一直差一个。
+        int shown = sRowsVisible > 0 ? sRowsVisible : sCountOrig - hidden;
         if (shown < 0) shown = 0;
         String want = shown + (sCountSuffix == null ? "节课程" : sCountSuffix);
         if (!want.equals(cur)) {
@@ -1705,6 +1779,8 @@ public class MainHook implements IXposedHookLoadPackage {
         sPendingDl = false;
         sDetailEnterT = now;
         sLastTouch = now;
+        sWantHoldCnt = 0;
+        sWantBusy = false;
         installTouchSpy(a);
         armAutoWant(a);
 
@@ -1734,6 +1810,15 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
+        // 从「搜索」进来的详情页：他只是在挑课、加想练，
+        // 不该被自动推进训练（否则看两秒退出就白记一笔「练过」）。
+        // 这里只做「加想练」，下载和开练都等他真点 GO 再说。
+        if (sPrevActName != null && sPrevActName.contains("Search")) {
+            sUserTookOver = true;
+            log("detail: from search -> auto-GO off (want only)");
+            return;
+        }
+
         if (!Cfg.autoGo) {
             sUserTookOver = true;
             log("detail: auto-GO disabled by config");
@@ -1743,6 +1828,21 @@ public class MainHook implements IXposedHookLoadPackage {
 
         log("detail resumed -> auto-GO armed (" + (detailIdleMs() / 1000) + "s)");
         armIdle(detailIdleMs(), false);
+
+        // 进详情页就并行把下载派发出去（面板是透明的，用户看不到）。
+        // 为什么要提前：用户点 GO 进训练后，下载只能靠 Keep 自己的下载器在后台跑；
+        // 等"练完回列表页再补下"要 15 秒 + 8 秒不动，实测用户早就退出 App 了，
+        // 表现就是"训练了但根本没下载"。
+        if (Cfg.autoDl && sDetailCourseId != null) {
+            final String dlCid = sDetailCourseId;
+            sMain.postDelayed(new Runnable() {
+                public void run() {
+                    if (sCur != a || a.isFinishing() || sGoTapped || sUserTookOver) return;
+                    log("detail: prewarm download " + dlCid);
+                    maybeAutoDownload(a);
+                }
+            }, 150);
+        }
 
         // 这里**不再**提前跑下载机器人。
         // v1.9 的「下载和倒计时并行」其实还是串行的：2 秒到点时面板才刚点开，
@@ -1754,53 +1854,228 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ---------------------------- 自动加入「想练」
     /**
-     * 详情页底部左侧有一个「想练」图标。用户希望"点进课程就自动进想练列表"，
-     * 所以新一次进入详情时看一眼那个按钮：文案正好是「想练」（未加入）才点，
-     * 已经是「已想练 / 取消想练」就跳过，免得把用户已经加过的取消掉。
-     * 同一门课在一次进程里只尝试一次。
+     * 详情页上有「想练」按钮：未加入时文案是「想练」，加入后变「已想练」。
+     *
+     * v2.3 为什么没生效（实测踩的三个坑）：
+     * 1. 只在进入详情页 900ms 后试一次。从搜索结果 / 推荐位进来的
+     *    CourseDetail8Activity 要 1.5~3 秒才渲染完底部操作栏，那一次必然找不到
+     *    按钮，而代码直接 return，**没有任何重试**。
+     * 2. findWantButton 只在屏幕 y > 55% 的位置找。实测这个按钮在不同入口/不同
+     *    课程下位置并不固定（有的在标题下方、有的在底部栏），于是永远命中不了。
+     * 3. 详情页自动开练只有 2 秒，900ms 才第一次尝试，留给重试的窗口几乎为零。
+     *
+     * 现在：进页面 250ms 就试第一次，找不到每 420ms 再试，最多 12 次（约 5 秒）；
+     * 整页找「文案/描述正好是 想练」的节点，不再限制位置；点完 900ms 复检，
+     * 必须变成「已想练」才算成功，否则最多再点一次（防止"点了但没点上"）。
      */
     static String sWantDoneCid = null;
+
+    /**
+     * 一次性探测 Keep 自己的下载入口。
+     *
+     * 目的：不再靠「点右上角…→下载面板」这套 UI，而是直接命令 Keep 去下载，
+     * 屏幕上什么都不出现。Keep 加固过、方法名被混淆，所以先在真机上把
+     * 这几个类的构造器/方法签名打出来，再按签名判断哪个是"加一条下载任务"。
+     */
+    static boolean sProbedDl = false;
+    /** 详情页里那个真正管下载的对象（构造时抓下来） */
+    static Object sDlDownloader = null;
+
+    /**
+     * 实验：不用点「…」、不弹面板，直接命令 Keep 去下载。
+     * 做法是从详情页的下载对象里取当前课程的下载实体，再调它自己的"入队"方法。
+     * 每门课只试一次，成败都写日志，看 download.db 条数是否真的增加。
+     */
+    void tryDirectDownload(Activity a) {
+        if (sDlDownloader == null) { log("direct: downloader not captured"); return; }
+        try {
+            Class<?> c = sDlDownloader.getClass();
+            Object ent = XposedHelpers.callStaticMethod(c, "d", sDlDownloader);
+            log("direct: entity=" + (ent == null ? "null" : ent.getClass().getSimpleName()));
+            if (ent == null) return;
+            for (String m : new String[]{"g", "h", "n"}) {
+                try {
+                    XposedHelpers.callStaticMethod(c, m, sDlDownloader, ent);
+                    log("direct: call " + m + " ok");
+                } catch (Throwable t) {
+                    log("direct: " + m + " fail " + t);
+                }
+            }
+        } catch (Throwable t) { log("direct: " + t); }
+    }
+
+    void probeDownloadApi() {
+        if (sProbedDl || sCtx == null) return;
+        sProbedDl = true;
+        String[] names = new String[]{
+            "com.gotokeep.keep.wt.business.course.detail8.function.download.loader.Detail8Downloader",
+            "com.gotokeep.keep.training.download.db.WorkoutDownloadDbManager",
+            "com.gotokeep.keep.domain.download.task.workout.NewWorkoutDownloadTask"
+        };
+        for (String n : names) {
+            try {
+                Class<?> c = Class.forName(n, false, sCtx.getClassLoader());
+                log("probe: class " + n);
+                if (n.contains("Detail8Downloader")) {
+                    try {
+                        XposedBridge.hookAllConstructors(c, new XC_MethodHook() {
+                            @Override protected void afterHookedMethod(MethodHookParam p) {
+                                sDlDownloader = p.thisObject;
+                                log("probe: captured downloader instance");
+                            }
+                        });
+                    } catch (Throwable t) { log("probe: ctor hook fail " + t); }
+                }
+                java.lang.reflect.Constructor<?>[] ks = c.getDeclaredConstructors();
+                for (java.lang.reflect.Constructor<?> k : ks) {
+                    log("probe:  ctor(" + java.util.Arrays.toString(k.getParameterTypes()) + ")");
+                }
+                java.lang.reflect.Method[] ms = c.getDeclaredMethods();
+                for (java.lang.reflect.Method m : ms) {
+                    log("probe:  m " + m.getName() + "("
+                            + java.util.Arrays.toString(m.getParameterTypes())
+                            + ") -> " + m.getReturnType().getName());
+                    // 顺手把「可能是下单入口」的几个方法挂上探针：
+                    // 走一遍 UI 下载，日志里谁被调用，谁就是真正的入口。
+                    final String mn = m.getName();
+                    if (n.contains("Detail8Downloader")) {
+                        try {
+                            XposedBridge.hookMethod(m, new XC_MethodHook() {
+                                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                                    // Kotlin 扩展函数编译成静态方法，第 0 个参数就是对象本身，
+                                    // 借任意一次调用来把这个实例抓下来。
+                                    if (sDlDownloader == null && p.args.length > 0 && p.args[0] != null
+                                            && p.args[0].getClass().getName().contains("Detail8Downloader")) {
+                                        sDlDownloader = p.args[0];
+                                        log("probe: captured downloader via " + mn);
+                                    }
+                                    if ("g".equals(mn) || "h".equals(mn) || "n".equals(mn)
+                                            || "p".equals(mn) || "s".equals(mn)) {
+                                        log("dlcall: " + mn + " args=" + p.args.length);
+                                    }
+                                }
+                            });
+                        } catch (Throwable t) { }
+                    }
+                }
+            } catch (Throwable t) {
+                log("probe: fail " + n + " " + t);
+            }
+        }
+    }
 
     void armAutoWant(final Activity a) {
         if (!Cfg.autoWant) return;
         final String cid = sDetailCourseId;
-        if (cid != null && cid.equals(sWantDoneCid)) return;
+        if (cid != null && cid.equals(sWantDoneCid)) {
+            log("auto-want: already handled " + cid);
+            return;
+        }
+        tryWant(a, cid, 0, 0);
+    }
+
+    void tryWant(final Activity a, final String cid, final int step, final int clicks) {
+        if (!Cfg.autoWant) return;
+        sWantBusy = true;
         sMain.postDelayed(new Runnable() {
             public void run() {
-                if (sCur != a || a.isFinishing()) return;
+                if (sCur != a || a.isFinishing()) {
+                    log("auto-want: page gone at try#" + step);
+                    return;
+                }
                 View root = decor(a);
                 if (root == null) return;
                 View btn = findWantButton(root, a, 0);
-                if (btn == null) { log("auto-want: button not found"); return; }
+                if (btn == null) {
+                    if (step + 1 < 12) { tryWant(a, cid, step + 1, clicks); return; }
+                    log("auto-want: button not found after " + (step + 1) + " tries");
+                    return;
+                }
                 String label = wantLabel(btn);
+                if (label == null) {
+                    if (step + 1 < 12) { tryWant(a, cid, step + 1, clicks); return; }
+                    log("auto-want: no label after " + (step + 1) + " tries");
+                    return;
+                }
                 if (!"想练".equals(label)) {
                     log("auto-want: already '" + label + "', skip");
                     sWantDoneCid = cid;
+                    sWantBusy = false;
                     return;
                 }
                 boolean ok = clickDeep(btn);
-                log("auto-want: click '" + label + "' ok=" + ok);
-                if (ok) sWantDoneCid = cid;
+                log("auto-want: try#" + step + " click '" + label + "' ok=" + ok
+                        + " clicks=" + (clicks + 1));
+                sMain.postDelayed(new Runnable() {
+                    public void run() {
+                        if (sCur != a || a.isFinishing()) {
+                            log("auto-want: left page before verify");
+                            sWantBusy = false;
+                            return;
+                        }
+                        View r2 = decor(a);
+                        View b2 = r2 == null ? null : findWantButton(r2, a, 0);
+                        String l2 = b2 == null ? null : wantLabel(b2);
+                        if (l2 != null && !"想练".equals(l2)) {
+                            log("auto-want: confirmed -> " + l2);
+                            sWantDoneCid = cid;
+                            sWantBusy = false;
+                            return;
+                        }
+                        if (clicks + 1 < 2 && step < 11) {
+                            log("auto-want: not applied yet ('" + l2 + "'), retry");
+                            tryWant(a, cid, step + 1, clicks + 1);
+                            return;
+                        }
+                        // performClick 对这类自绘按钮常出现"返回 true 但界面没变"。
+                        // 补一次真实触摸（坐标注入），再多等一会儿复检。
+                        if (b2 != null && clicks + 1 < 4) {
+                            int[] loc = new int[2];
+                            b2.getLocationOnScreen(loc);
+                            final float cx = loc[0] + b2.getWidth() / 2f;
+                            final float cy = loc[1] + b2.getHeight() / 2f;
+                            log("auto-want: inject tap @" + (int) cx + "," + (int) cy);
+                            dispatchTapAt(a, cx, cy);
+                            sMain.postDelayed(new Runnable() {
+                                public void run() {
+                                    if (sCur != a || a.isFinishing()) {
+                                        log("auto-want: left page after inject");
+                                        sWantBusy = false;
+                                        return;
+                                    }
+                                    View r3 = decor(a);
+                                    View b3 = r3 == null ? null : findWantButton(r3, a, 0);
+                                    String l3 = b3 == null ? null : wantLabel(b3);
+                                    if (l3 != null && !"想练".equals(l3)) {
+                                        log("auto-want: confirmed after inject -> " + l3);
+                                        sWantDoneCid = cid;
+                                    } else {
+                                        log("auto-want: gave up after inject ('" + l3 + "')");
+                                    }
+                                    sWantBusy = false;
+                                }
+                            }, 1600);
+                            return;
+                        }
+                        sWantBusy = false;
+                        log("auto-want: gave up ('" + l2 + "')");
+                    }
+                }, 950);
             }
-        }, 900);
+        }, step == 0 ? 250 : 420);
     }
 
-    /** 只在屏幕下半部分找「想练」，避免命中正文里同名的推荐文案 */
+    /**
+     * 整页找「想练」，不再限制 y 坐标。
+     * 只认文案/描述**完全等于**这几个词的节点，所以正文里提到"想练"不会被误点。
+     */
     View findWantButton(View v, Activity a, int depth) {
         if (depth > 30 || !(v instanceof ViewGroup)) return null;
-        int screenH = a.getResources().getDisplayMetrics().heightPixels;
         ViewGroup g = (ViewGroup) v;
         for (int i = 0; i < g.getChildCount(); i++) {
             View c = g.getChildAt(i);
             String label = wantLabel(c);
-            if (label != null && c.isShown()) {
-                int[] p = new int[2];
-                try { c.getLocationOnScreen(p); } catch (Throwable ignored) { p[1] = 0; }
-                if (p[1] > screenH * 0.55f) {
-                    View clickable = nearestClickable(c);
-                    if (clickable != null) return clickable;
-                }
-            }
+            if (label != null && c.isShown() && c.getHeight() > 0) return c;
             View r = findWantButton(c, a, depth + 1);
             if (r != null) return r;
         }
@@ -1811,21 +2086,23 @@ public class MainHook implements IXposedHookLoadPackage {
         if (v instanceof TextView) {
             String t = String.valueOf(((TextView) v).getText()).trim();
             if ("想练".equals(t) || "加入想练".equals(t) || "已想练".equals(t)
-                    || "取消想练".equals(t)) return t;
+                    || "取消想练".equals(t) || "已加入想练".equals(t)) return t;
         }
         try {
             CharSequence d = v.getContentDescription();
             if (d != null) {
                 String s = String.valueOf(d).trim();
-                if (s.contains("加入想练") || s.equals("想练")) return "想练";
+                if ("想练".equals(s) || "加入想练".equals(s)) return "想练";
+                if ("已想练".equals(s) || "取消想练".equals(s)) return "已想练";
             }
         } catch (Throwable ignored) {}
         return null;
     }
 
+    /** 从文本节点往上找可点击祖先；clickDeep 会继续向上兜底 */
     View nearestClickable(View v) {
         View cur = v;
-        for (int i = 0; i < 4 && cur != null; i++) {
+        for (int i = 0; i < 6 && cur != null; i++) {
             if (cur.isClickable()) return cur;
             android.view.ViewParent p = cur.getParent();
             cur = (p instanceof View) ? (View) p : null;
@@ -1837,6 +2114,11 @@ public class MainHook implements IXposedHookLoadPackage {
         initIds(a);
         sSleeping = false;
         sLastTouch = SystemClock.uptimeMillis();
+        // 点 GO 就算数：进训练这一刻就把课放进下载队列。
+        // 不能等"训练结束"——用户经常练几秒就退出，甚至按返回直接退到桌面，
+        // 那种情况下 Keep 不会给下一个页面 onResume，我们的"训练结束"信号永远
+        // 不会触发，课就再也不会进队列（实测就是这样丢掉下载的）。
+        markTrainingQueued();
         installTouchSpy(a);
         // 训练是唯一真正会出声的环节（教练语音 / 节拍 / 提示音全走 STREAM_MUSIC）。
         // 进训练页这一刻就强制压到目标音量，不等 1.2 秒的轮询。
@@ -1892,15 +2174,36 @@ public class MainHook implements IXposedHookLoadPackage {
                     screenOff();
                 } else {
                     if (!DETAIL.equals(cn) || sGoTapped || sUserTookOver) return;
+                    // 「加想练」还没处理完就别急着点 GO：2 秒窗口里经常是
+                    // 刚点完想练、状态还没回写就跳进训练，结果想练根本没加上。
+                    // 只顺延 1 次（1.2 秒）—— 再长用户就能感觉到"不是 2 秒了"。
+                    // 已经"已想练"的课不走这条路（tryWant 里直接放开 sWantBusy）。
+                    if (Cfg.autoWant && sWantBusy && sWantHoldCnt < 1) {
+                        sWantHoldCnt++;
+                        log("auto-GO hold (auto-want busy) #" + sWantHoldCnt);
+                        sMain.postDelayed(this, 1200);
+                        return;
+                    }
                     // 页面上一旦有弹层（右上角「…」的更多选项、下载面板等），
                     // 说明用户在操作别的事情，绝不能在这时候替他点 GO。
                     // 下载机器人自己开的面板除外 —— 那是我们自己的窗口，不算用户操作。
                     if (!sDlBusy && anyDialogShowing()) { log("auto-GO hold (dialog open)"); return; }
                     if (!screenIsOn()) { log("auto-GO hold (screen off)"); return; }
-                    // 只有在下载机器人正好在跑（队列泵 / 已经点开的面板）时才让一让，
-                    // 它收工后会重新挂计时。正常进详情页这条路不会有 sDlBusy，
-                    // 所以 2 秒就是 2 秒，不再被下载拖成 5 秒。
-                    if (sDlBusy) { log("auto-GO hold (auto-download running)"); return; }
+                    // 详情页现在会**并行**预派发下载（否则用户点 GO 进训练、
+                    // 几秒后退出时，课根本还没进 Keep 的下载器）。
+                    // 2 秒到点时：已派发就关掉面板立刻开练；还没派发就最多再等 1.8 秒。
+                    // 这样既保证"2 秒进训练"，又保证下载真的已经开始。
+                    if (sDlBusy) {
+                        if (sDlDispatched) {
+                            log("auto-GO: dispatched, close panel & go");
+                            dismissDialogs();
+                            dlDone("dispatched");
+                        } else {
+                            log("auto-GO: wait dispatch (max 1.8s)");
+                            waitDlThenGo(a, 4);
+                            return;
+                        }
+                    }
                     sGoTapped = true;
                     tapGoRetry(a, 0);
                 }
@@ -2172,6 +2475,12 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         stopVolWatch();
+        // 先记住"进 Keep 之前手机本来是多大声音"。离开 Keep 时要还回去，
+        // 否则退出后手机一直停在静音，微信语音、音乐全没声。
+        if (sVolRestore < 0) {
+            int cur0 = mediaVol();
+            if (cur0 >= 0) sVolRestore = cur0;
+        }
         if (Cfg.volTarget >= 0) {
             // 固定目标值：不读当前音量，直接设成配置值（默认 0 = 静音）。
             // 这样无论你进 Keep 前把音量调到多大，进来都被压到目标值。
@@ -2219,9 +2528,16 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     void stopVolSession() {
+        int restore = sVolRestore;
         if (sVolBaseline >= 0) log("vol session end (baseline=" + sVolBaseline + ")");
         sVolBaseline = -1;
+        sVolRestore = -1;
         stopVolWatch();
+        // 真正离开 Keep 了：把音量还原成进来之前的值
+        if (restore >= 0 && mediaVol() != restore) {
+            log("vol: restore on exit -> " + restore);
+            applyMediaVol(restore);
+        }
     }
 
     // ------------------------------------------------------- 训练收尾链路
@@ -2616,6 +2932,52 @@ public class MainHook implements IXposedHookLoadPackage {
         }, 260);
     }
 
+    // ------------------------------------------------------------- 音量接管
+
+    /**
+     * 真凶在这里：Keep 训练页每次起播/切动作都会自己调 setStreamVolume 把媒体音量
+     * 拉回它记的值（实测日志里反复出现 setStreamVolume(index:75) from com.gotokeep.keep）。
+     * 所以设置页里把卡片拨到 0%，进训练一播放又被拉回去，看起来就是"卡片没接上、音量被别的东西接管"。
+     * 这里在 Keep 进程里拦住这个调用，把它想设的值改成卡片要求的值 —— 卡片才真正说了算。
+     */
+    void hookVolume() {
+        try {
+            XposedHelpers.findAndHookMethod(android.media.AudioManager.class,
+                    "setStreamVolume", int.class, int.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        if (!Cfg.volLock || Cfg.volTarget < 0) return;
+                        if (((Integer) p.args[0]) != AudioManager.STREAM_MUSIC) return;
+                        int want = Cfg.volTarget;
+                        int asked = (Integer) p.args[1];
+                        if (asked != want) {
+                            p.args[1] = want;
+                            if (asked != lastVolAsk) {
+                                lastVolAsk = asked;
+                                log("vol: keep asked " + asked + " -> force " + want);
+                            }
+                        }
+                    } catch (Throwable t) {}
+                }
+            });
+            XposedHelpers.findAndHookMethod(android.media.AudioManager.class,
+                    "adjustStreamVolume", int.class, int.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        if (!Cfg.volLock || Cfg.volTarget < 0) return;
+                        if (((Integer) p.args[0]) != AudioManager.STREAM_MUSIC) return;
+                        p.setResult(null);                       // 吞掉这次加/减
+                        applyMediaVol(Cfg.volTarget);           // 直接钉回目标值
+                    } catch (Throwable t) {}
+                }
+            });
+            log("vol: hook installed (lock=" + Cfg.volLock + " target=" + Cfg.volTarget + ")");
+        } catch (Throwable t) { log("hookVolume " + t); }
+    }
+
+    /** 上一次 Keep 自己请求的音量，仅用于日志去重 */
+    static int lastVolAsk = -1;
+
     // ------------------------------------------------------------- 弹窗处理
 
     void hookDialog() {
@@ -2633,8 +2995,29 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     final Dialog d = (Dialog) p.thisObject;
                     ensureMain();
-                    if (sDlBusy && isDownloadPanel(d)) hidePanel(d);   // 确实是下载面板：再压一次保险
-                    else showPanel(d);   // 不是下载面板（或机器人已收工）：把误隐藏的恢复可见
+                    // 下载机器人干活期间，新弹窗先一律压透明。
+                    // 老代码在这里"立刻"用 findViewById 判断它是不是下载面板，但这一刻
+                    // 面板内容还没 inflate，判定必然失败 → 紧接着就 showPanel 恢复可见，
+                    // 用户眼前就会闪一下"…→下载"面板（日志里 panel hidden 后面紧跟
+                    // restored a non-download dialog）。改成 520ms 后复判。
+                    if (sDlBusy) {
+                        hidePanel(d);
+                        sMain.postDelayed(new Runnable() {
+                            public void run() {
+                                try {
+                                    if (!d.isShowing()) return;
+                                    if (sDlBusy || isDownloadPanel(d)) {
+                                        hidePanel(d);
+                                        log("dl: panel keep hidden");
+                                    } else {
+                                        showPanel(d);
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        }, 520);
+                    } else {
+                        showPanel(d);
+                    }
                     noteDialog(d, true);
                     sMain.postDelayed(new Runnable() {
                         public void run() { handleDialog(d, "dialog"); }
@@ -2802,6 +3185,23 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /** 训练结束：把这门课记进「待下载」，并安排立刻下好 */
+    /**
+     * 点 GO 进训练时就入队（幂等）。
+     * 与 markTrainedCourseForDownload 的区别：这里不 armPump —— 用户还在训练，
+     * 别挂一个 15 秒后要抢页面的任务；真正的补下由详情页预派发 / 回列表页时的泵负责。
+     */
+    void markTrainingQueued() {
+        String cid = sTrainingCourseId != null ? sTrainingCourseId : sDetailCourseId;
+        if (cid == null) { log("dl: training start, cid unknown"); return; }
+        loadNeedDownload();
+        if (sNeedDownload.add(cid)) {
+            saveNeedDownload();
+            log("dl: queued at training start " + cid);
+        } else {
+            log("dl: already queued at training start " + cid);
+        }
+    }
+
     void markTrainedCourseForDownload() {
         String cid = sTrainingCourseId;
         sTrainingCourseId = null;
@@ -2817,7 +3217,9 @@ public class MainHook implements IXposedHookLoadPackage {
         // 15 秒而不是 7 秒：补下必须打开详情页，太早会"页面自己跳走"。
         // 用户明确讨厌这个观感，所以把动作推到他已经停下来之后。
         sPumpArmT = 0;
-        armPump(15000);
+        // 15 秒太长：多数人练完就回列表翻课，甚至直接切走。
+        // 8 秒足够避开"刚落地还在滑动"的时刻，又不至于让人以为没下载。
+        armPump(8000);
     }
 
     /**
@@ -2843,6 +3245,25 @@ public class MainHook implements IXposedHookLoadPackage {
                     a.finish();
                     a.overridePendingTransition(0, 0);
                 } catch (Throwable t) { log("closeAutoDetail fail " + t); }
+                // finish() 不一定管用：详情页可能自己拦返回，或 Keep 又把它拉回来。
+                // 实测出现过「关闭失败 → 用户被扔在一个没打算打开的详情页里」，
+                // 1.2 秒后复核一次，还停在非列表页就直接 finish + 拉回课程页。
+                sMain.postDelayed(new Runnable() {
+                    public void run() {
+                        Activity cur = sCur;
+                        if (cur == null) return;
+                        String c = cur.getClass().getName();
+                        if (COURSE.equals(c) || MAIN.equals(c) || DOWNLOADS.equals(c)) return;
+                        log("dl: still on " + c + " -> force back to course");
+                        try { cur.finish(); } catch (Throwable t) { }
+                        try {
+                            Intent i = new Intent();
+                            i.setClassName(KEEP, COURSE);
+                            i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                            sCtx.startActivity(i);
+                        } catch (Throwable t) { log("force back fail " + t); }
+                    }
+                }, 1200);
             }
         }
         // 队列泵：还有没下完的课就接着下一门
@@ -2895,14 +3316,7 @@ public class MainHook implements IXposedHookLoadPackage {
             log("pump: cellular or unvalidated, keep in queue (wifi_only=" + (Cfg.wifiOnly ? 1 : 0) + ")");
             return;
         }
-        if (!screenIsOn()) {
-            if (sPumpProbe < 20) {
-                sPumpProbe++;
-                log("pump: screen off, retry " + sPumpProbe);
-                sMain.postDelayed(new Runnable() { public void run() { pumpStep(); } }, 4000);
-            }
-            return;
-        }
+        // 训练中/收尾中绝不抢页面（先于屏幕判断，免得训练息屏把等待次数耗光）
         if (sInTraining || sWrapUp) {
             if (sPumpProbe < 12) {
                 sPumpProbe++;
@@ -2911,6 +3325,20 @@ public class MainHook implements IXposedHookLoadPackage {
             } else {
                 sPumpProbe = 0;
                 log("pump: busy too long, stays in queue");
+            }
+            return;
+        }
+        if (!screenIsOn()) {
+            // 练完手机丢一边、屏幕黑着是常态。以前重试 20 次（80 秒）就彻底放弃，
+            // 结果"练完的课没下完"。现在改成：先快试三次，之后每 20 秒静默等一次，
+            // 用户什么时候亮屏就什么时候接着下（10 分钟窗口别处已经卡着）。
+            sPumpProbe++;
+            if (sPumpProbe <= 3) {
+                log("pump: screen off, retry " + sPumpProbe);
+                sMain.postDelayed(new Runnable() { public void run() { pumpStep(); } }, 4000);
+            } else {
+                if (sPumpProbe == 4) log("pump: screen off, wait for next unlock (" + sNeedDownload.size() + " left)");
+                sMain.postDelayed(new Runnable() { public void run() { pumpStep(); } }, 20000);
             }
             return;
         }
@@ -2936,9 +3364,18 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         sPumpProbe = 0;
+        // 「为了下载而跳详情页」只允许发生在刚练完的 10 分钟窗口里。
+        // 之前没这条限制：训练结束把几门课排进队列后，用户隔天打开 App 翻列表，
+        // 泵还会一门一门跳详情页（每次跳的课还不一样），看起来就是
+        // 「一进练过页就莫名进了某门课的详情页」。超过窗口就安安静静留在队列里，
+        // 等下一次练完再补。
+        if (sTrainingEnd == 0 || SystemClock.uptimeMillis() - sTrainingEnd > 600000L) {
+            log("pump: no recent training, stay in queue (" + sNeedDownload.size() + " left)");
+            return;
+        }
         // 用户刚动过屏幕就别抢页面。补下要打开详情页，是肉眼可见的跳转，
-        // 所以要求连续 8 秒没触摸才动手（v1.9 是 4 秒，仍然会在你刚放下手时跳走）。
-        if (SystemClock.uptimeMillis() - sLastTouch < 8000) {
+        // 所以要求连续 15 秒没触摸才动手（原来是 8 秒，实测仍然会在刚放下手时跳走）。
+        if (SystemClock.uptimeMillis() - sLastTouch < 15000) {
             log("pump: user active, retry in 3s");
             sMain.postDelayed(new Runnable() { public void run() { pumpStep(); } }, 3000);
             return;
@@ -3056,6 +3493,34 @@ public class MainHook implements IXposedHookLoadPackage {
         return cid == null || cid.length() < 20 ? null : cid.substring(0, 20);
     }
 
+    /**
+     * 同步查一次 download.db：这门课是否已被 Keep 的下载器接手（下载中或已完成）。
+     * download.db 很小（20~30KB），90 秒才调用一次，主线程读没有压力。
+     */
+    boolean dbHasCid(String cid) {
+        String k = cidKey(cid);
+        if (k == null) return false;
+        try {
+            java.io.File f = new java.io.File(
+                    "/data/data/com.gotokeep.keep/databases/download.db");
+            if (!f.exists()) return false;
+            android.database.sqlite.SQLiteDatabase db =
+                    android.database.sqlite.SQLiteDatabase.openDatabase(
+                            f.getAbsolutePath(), null,
+                            android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+            android.database.Cursor c = db.rawQuery(
+                    "select status from download_data where workoutId like ?",
+                    new String[]{k + "%"});
+            boolean has = c.moveToFirst();
+            c.close();
+            db.close();
+            return has;
+        } catch (Throwable t) {
+            log("dbHasCid fail " + t);
+            return false;
+        }
+    }
+
     /** 后台刷新「下载库里有哪些课」，60 秒一次；主线程只读内存集合 */
     void loadDbCidsAsync() {
         long now = SystemClock.uptimeMillis();
@@ -3107,10 +3572,13 @@ public class MainHook implements IXposedHookLoadPackage {
             log("dl: already in download.db -> " + cid);
             return true;
         }
+        // 只认 download.db，不再看本地文件大小。
+        // 训练时边播边存，7 秒就能留下几 MB 的视频缓存；以前 512KB 以上就当成
+        // "已经下好了"，于是练过的课永远不进下载、下载课程页里也永远没有它 ——
+        // 这就是"点 GO 两三秒退出，下载只做一半"的根子。
         long n = courseSize(cid);
-        if (n <= DL_ENOUGH_BYTES) return false;
-        log("dl: on-disk already " + n + " bytes for " + cid);
-        return true;
+        if (n > 0) log("dl: partial cache " + n + " bytes (not counted as downloaded) " + cid);
+        return false;
     }
 
     /** 详情页 resume 时调用：练过但没下载的课程，自动走一遍「… → 下载 → 全部下载」 */
@@ -3133,8 +3601,12 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         boolean queued = sNeedDownload.contains(cid);
-        // 最近确认过（且没过复检周期）的课就不再折腾，否则每次进详情页都要多等两秒
-        if (!queued && checkedFresh(cid)) return;
+        // 以前：7 天内确认过就不再折腾。但"确认过"可能只是看过一眼、根本没下成，
+        // 于是这门课永远下不下来。现在只有真下好了（download.db 有记录，上面已返回）
+        // 才跳过；其余情况一律重试。
+        if (!queued && checkedFresh(cid)) {
+            log("dl: checked before but still not downloaded -> retry " + cid);
+        }
         if (!isOnline()) {
             if (queued) log("dl: offline, postpone " + cid);
             return;
@@ -3193,6 +3665,10 @@ public class MainHook implements IXposedHookLoadPackage {
             String c = ranCid != null ? ranCid : sDetailCourseId;
             dequeueCid(c);
             markChecked(c);
+            // 让 courseDownloadedOnDisk 立刻看到新记录，别等 60 秒缓存过期
+            sDbLoaded = false;
+            sDbLoadT = 0;
+            loadDbCidsAsync();
             // 「任务派出去了」不等于「下载完了」：过一会儿再看一眼体积。
             // 已下载的课本来就不会再增长，跳过校验，否则会被误判"没下成"重新排队。
             if ("dispatched".equals(why) && !sSawDownloaded) armVerify(c);
@@ -3232,8 +3708,13 @@ public class MainHook implements IXposedHookLoadPackage {
         sMain.postDelayed(new Runnable() {
             public void run() {
                 if (!isOnline()) { log("dl: verify skipped (offline) " + cid); return; }
+                // download.db 里的 download_data 才是权威信号。
+                // v2.3 之前拿 course_<cid> 目录体积当判断依据，而那个目录只是索引缓存
+                // （视频实际落在 Movies/MultiVideos），体积一直不变 → 每次都误判"没下成"
+                // → 重新入队 → 白白再下一遍。
+                boolean inDb = dbHasCid(cid);
                 long now = courseSize(cid);
-                boolean grew = before > 0 && now > before + 65536;
+                boolean grew = inDb || (before > 0 && now > before + 65536);
                 Integer n = sVerifyTries.get(cid);
                 int tries = n == null ? 0 : n;
                 log("dl: verify " + cid + " before=" + before + " now=" + now

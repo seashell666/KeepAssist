@@ -4,7 +4,7 @@
 
 它把「打开 Keep → 找到课 → 点开始」这一串操作压到最少：跳过开屏广告、启动直接到「我的课程 → 练过」、进详情页 2 秒不动就开练、训练中自动息屏、练完自动回到列表并把课补下载好。全部行为可在设置页配置。
 
-> **当前版本 v2.3**（`versionName=2.3`，`versionCode=14`，2026-11-23）
+> **当前版本 v2.4**（`versionName=2.4`，`versionCode=15`，2026-11-26）
 > 实测环境：小米 11 / Android 13 / MIUI / Keep 9.1.110 / Magisk 28.1 / Vector
 > 需要 **root** 与 Xposed 框架，作用域仅限 Keep。
 
@@ -29,7 +29,7 @@
 
 ## 安装
 
-从 [Releases](../../releases) 下载 `KeepAssist-Magisk-v2.3.zip`（推荐，自动装 APK 并配置 root 权限）或 `KeepAssist-v2.3.apk`：
+从 [Releases](../../releases) 下载 `KeepAssist-Magisk-v2.4.zip`（推荐，自动装 APK 并配置 root 权限）或 `KeepAssist-v2.4.apk`：
 
 1. 刷入 Magisk 包，或手动安装 APK
 2. Vector / LSPosed 管理器 → 模块 → 启用「Keep 助手」
