@@ -3111,6 +3111,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     } else {
                         showPanel(d);
                     }
+                    handleStopConfirm(d);
                     noteDialog(d, true);
                     sMain.postDelayed(new Runnable() {
                         public void run() { handleDialog(d, "dialog"); }
@@ -4196,6 +4197,31 @@ public class MainHook implements IXposedHookLoadPackage {
             Window w = d.getWindow();
             return w == null ? null : w.getDecorView();
         } catch (Throwable t) { return null; }
+    }
+
+    /**
+     * 训练中用户点左下角红色「停止」→ Keep 必弹确认框：
+     *   ·「训练时间过短，无法保存记录，再坚持一下吧？」（结束训练 / 再练一会）
+     *   ·「确定结束本次训练并保存记录吗？」（确定 / 取消）
+     * 用户要求：点停止就直接结束，不要看见这个弹窗。
+     * 这里在 Dialog.show() 返回的同一帧内同步替他点「结束训练 / 确定」，
+     * 弹窗来不及绘制，视觉上完全不出现（不是模拟点屏幕，是直接调按钮）。
+     */
+    void handleStopConfirm(Dialog d) {
+        try {
+            Activity cur = sCur;
+            String cn = cur == null ? "" : cur.getClass().getName();
+            if (!TRAINING.equals(cn)) return;
+            View root = popupRoot(d);
+            String all = textOf(root);
+            if (all == null || all.length() == 0) return;
+            if (!all.contains("训练时间过短") && !all.contains("结束本次训练")
+                    && !all.contains("确定结束")) return;
+            View end = findByTextIn(root, new String[]{"结束训练", "确定", "确认"});
+            if (end == null) return;
+            clickDeep(end);
+            log("training stop -> auto-confirm (dialog suppressed)");
+        } catch (Throwable t) { log("handleStopConfirm " + t); }
     }
 
     /** 收尾期弹窗一律关掉；平时交给 inspect 精准识别，避免误伤正常弹窗 */
