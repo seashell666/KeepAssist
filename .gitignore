@@ -17,3 +17,6 @@ toolchain/
 Thumbs.db
 .idea/
 *.iml
+
+# 本地打包产物（Release 附件由 release-assets/*.b64 解码生成）
+dist/

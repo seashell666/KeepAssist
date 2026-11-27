@@ -624,6 +624,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         onSplash(a);
                     } else if (COURSE.equals(cn)) {
                         onCourse(a);
+                    } else if (DOWNLOADS.equals(cn)) {
+                        onDownloads(a);
                     } else if (DETAIL.equals(cn)) {
                         onDetail(a);
                     } else if (TRAINING.equals(cn)) {
@@ -936,6 +938,19 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
+    /**
+     * 下载课程页（离线入口）：和「我的课程」一样支持标题栏长按 0.7 秒打开 Keep 助手。
+     * 用户 2026-11-27 点名要求：左右空白处按住、标题变红、进设置页。
+     */
+    void onDownloads(final Activity a) {
+        initIds(a);
+        installTouchSpy(a);
+        sMain.postDelayed(new Runnable() {
+            public void run() { cacheCourseTitle(a, "下载课程"); }
+        }, 350);
+        log("downloads resumed: title long-press armed");
+    }
+
     // ------------------------------------------- 无操作自动化（详情页 / 训练页）
 
     /**
@@ -981,6 +996,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (KEEP.equals(a.getPackageName())) markPaused(a);
                     if (DETAIL.equals(cn) || TRAINING.equals(cn)) {
                         cancelIdle(cn.substring(cn.lastIndexOf('.') + 1));
+                    }
+                    if (TRAINING.equals(cn)) {
+                        // 离开训练页（返回 / Home / 练完）时把窗口亮度还回去，
+                        // 避免「假息屏」的亮度留在栈里的旧实例上
+                        sSleeping = false;
+                        wakeWindow(a);
                     }
                 }
             });
@@ -1059,6 +1080,27 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /** 课程页的触摸：按住 550ms 不动 = 长按 */
+    /** 只带「标题栏长按入口」的页面（下载课程页）—— 不做列表项长按移除 */
+    void handleTitleOnlyTouch(MotionEvent e) {
+        if (e == null) return;
+        int act = e.getActionMasked();
+        float x = e.getRawX(), y = e.getRawY();
+        if (act == MotionEvent.ACTION_DOWN) {
+            if (sTitlePressing) endTitlePress();
+            if (hitCourseTitle(x, y)) {
+                startTitlePress(x, y);
+            }
+            return;
+        }
+        if (sTitlePressing) {
+            if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL
+                    || Math.abs(x - sTitleDownX) > LONG_SLOP
+                    || Math.abs(y - sTitleDownY) > LONG_SLOP) {
+                endTitlePress();
+            }
+        }
+    }
+
     void handleCourseTouch(MotionEvent e) {
         if (e == null) return;
         int act = e.getActionMasked();
@@ -1127,7 +1169,10 @@ public class MainHook implements IXposedHookLoadPackage {
     static final int  TITLE_PRESS_COLOR = 0xFFD2525E;
 
     /** 找到顶部那个「我的课程」标题并记住它（换 tab / 重进页面会重建，所以要刷新） */
-    void cacheCourseTitle(Activity a) {
+    void cacheCourseTitle(Activity a) { cacheCourseTitle(a, "我的课程"); }
+
+    /** 找顶部标题（我的课程 / 下载课程），记住它用于长按入口 */
+    void cacheCourseTitle(Activity a, String want) {
         try {
             View root = decor(a);
             if (root == null) return;
@@ -1138,7 +1183,7 @@ public class MainHook implements IXposedHookLoadPackage {
             TextView best = null;
             for (int i = 0; i < tvs.size(); i++) {
                 TextView t = tvs.get(i);
-                if (!"我的课程".equals(String.valueOf(t.getText()))) continue;
+                if (!want.equals(String.valueOf(t.getText()))) continue;
                 if (!t.isShown() || t.getHeight() <= 0) continue;
                 try { t.getLocationOnScreen(loc); } catch (Throwable ignored) { continue; }
                 if (loc[1] < 0 || loc[1] > screenH * 0.18f) continue;
@@ -1150,7 +1195,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             sCourseTitle = new java.lang.ref.WeakReference<TextView>(best);
             sTitleOrigColor = best.getCurrentTextColor();
-            log("title hook: 我的课程 @" + best.getWidth() + "x" + best.getHeight()
+            log("title hook: " + want + " @" + best.getWidth() + "x" + best.getHeight()
                     + " color=" + Integer.toHexString(sTitleOrigColor));
         } catch (Throwable t) { log("cacheCourseTitle fail " + t); }
     }
@@ -1728,7 +1773,16 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (e == null) return;
                 int act = e.getActionMasked();
                 String cn = cur.getClass().getName();
+                if (act == MotionEvent.ACTION_DOWN && sSleeping) {
+                    // 假息屏中用户碰屏幕：立刻恢复亮度，重新计 7 秒再暗
+                    sSleeping = false;
+                    wakeWindow(cur);
+                    if (TRAINING.equals(cn) && trainingIdleMs() > 0) {
+                        armIdle(trainingIdleMs(), true);
+                    }
+                }
                 if (COURSE.equals(cn)) handleCourseTouch(e);
+                else if (DOWNLOADS.equals(cn)) handleTitleOnlyTouch(e);
                 if (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_MOVE) {
                     onUserTouch(cn);
                 }
@@ -2170,8 +2224,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (sleepMode) {
                     if (!TRAINING.equals(cn) || sSleeping) return;
                     sSleeping = true;
-                    log("TRAINING idle " + (delayMs / 1000) + "s -> screen off");
-                    screenOff();
+                    log("TRAINING idle " + (delayMs / 1000) + "s -> dim (training keeps running)");
+                    fakeSleep(a);
                 } else {
                     if (!DETAIL.equals(cn) || sGoTapped || sUserTookOver) return;
                     // 「加想练」还没处理完就别急着点 GO：2 秒窗口里经常是
@@ -2324,6 +2378,45 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     void screenOff() {
         rootCmd("input keyevent 223", "screenOff");
+    }
+
+    /**
+     * 「假息屏」：训练页窗口亮度压到 0，Activity 保持前台。
+     *
+     * 为什么不用真息屏（KEYCODE_SLEEP）：
+     * 2026-11-27 新手机实测 —— 真息屏后 Keep 训练引擎立刻暂停训练
+     * （计时停在 00:08、音频轨道 0 active），亮屏才从暂停处继续。
+     * 用户要的是"屏幕黑着、训练和音频继续"，所以只压窗口亮度：
+     * Activity 不 pause，训练/计时/音频全部继续，视觉上和息屏一样。
+     * 同时挂 FLAG_KEEP_SCREEN_ON，避免系统超时把屏幕真关掉。
+     */
+    void fakeSleep(final Activity a) {
+        if (a == null) return;
+        try {
+            a.runOnUiThread(new Runnable() {
+                public void run() {
+                    try {
+                        a.getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        android.view.WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+                        lp.screenBrightness = 0.0f;
+                        a.getWindow().setAttributes(lp);
+                        log("fake sleep: window brightness -> 0 (training keeps running)");
+                    } catch (Throwable t) { log("fakeSleep fail " + t); }
+                }
+            });
+        } catch (Throwable t) { log("fakeSleep post fail " + t); }
+    }
+
+    /** 恢复窗口亮度（用户碰屏幕 / 离开训练页时调用） */
+    void wakeWindow(Activity a) {
+        if (a == null) return;
+        try {
+            a.getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            android.view.WindowManager.LayoutParams lp = a.getWindow().getAttributes();
+            lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+            a.getWindow().setAttributes(lp);
+            log("window brightness restored");
+        } catch (Throwable t) { log("wakeWindow fail " + t); }
     }
 
     /** 统一的 root 命令执行。必须放子线程：waitFor 会阻塞，主线程卡住整个 UI 就冻了 */

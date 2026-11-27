@@ -369,7 +369,7 @@ public class SettingsActivity extends Activity {
         swSleep = toggle(true);
         LinearLayout c3 = card();
         c3.addView(head("OFF", "训练中自动息屏",
-                "到时间没操作就熄屏省电，拉到底关闭", swSleep));
+                "到时间没操作就屏幕变黑，训练和音频继续；拉到底关闭", swSleep));
         LinearLayout sleepRow = new LinearLayout(this);
         sleepRow.setOrientation(LinearLayout.HORIZONTAL);
         sleepRow.setGravity(Gravity.CENTER_VERTICAL);
