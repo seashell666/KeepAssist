@@ -75,8 +75,8 @@
 
 | 文件 | SHA-256 |
 |---|---|
-| `KeepAssist-v2.4.apk` | `56391c902ac0f04fe124b1556d22f19c248d1a743e070827793fb7701c090967` |
-| `KeepAssist-Magisk-v2.4.zip` | `868e457a46a477e8ee46e1b130552d36a01622d8439c044297b4af22f676220d` |
+| `KeepAssist-v2.4.apk` | `ac769a39181bfca047e1594a022c9ea0b3547f3c82675ce0f8a25574e39b3c3b` |
+| `KeepAssist-Magisk-v2.4.zip` | `a956d9cf0323c67fc468da676c4b77c57f8cc28c9d27eda2e2c42227ab535201` |
 
 ## 环境
 
